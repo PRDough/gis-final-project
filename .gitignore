@@ -1,0 +1,10 @@
+*.rds
+/.quarto/
+_freeze/
+.DS_Store
+.RData
+.Rhistory
+_freeze/
+site_libs/
+index_files/
+data/

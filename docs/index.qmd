@@ -1,0 +1,2345 @@
+---
+title: "Who’s \"Steeling\" the Show? Layoffs and Local Voices in U.S. IRA Rulemaking"
+subtitle: "DSAN 6750 / PPOL 6805: GIS for Spatial Data Science"
+authors:
+  - name: Puran Dou
+    email: pd757@georgetown.edu
+    affiliation: Georgetown University
+    corresponding: true
+df-print: kable
+bibliography: GIS_Manuscript.bib
+title-block-banner: "#E69F0095"
+title-block-banner-color: "black"
+format:
+  html:
+    self-contained: false
+    code-fold: true
+    code-summary: "Show code"
+    df-print: kable
+  pdf:
+    # https://quarto.org/docs/reference/formats/pdf.html
+    link-citations: true
+prefer-html: true
+---
+
+
+```{r}
+#| label: setup
+#| include: false
+#| warning: false
+#| message: false
+
+knitr::opts_chunk$set(
+  fig.width  = 9,
+  fig.height = 5,
+  dpi        = 300
+)
+
+library(modelsummary)
+library(tidyverse)
+library(knitr)
+library(sf)
+library(spdep)
+library(viridis)
+library(haven)
+library(tigris)
+library(spatialreg)
+library(grid)
+
+theme_set(theme_classic())
+options(tigris_use_cache = TRUE)
+options(dplyr.summarise.inform = FALSE)
+```
+
+```{r}
+#| label: paths
+#| include: false
+
+DATA_DIR <- "data"
+
+PATH_PANEL  <- file.path(DATA_DIR, "master_panel_fips_year_25fin.dta")
+PATH_COMM22 <- file.path(DATA_DIR, "ira_dbscan_fips_year_features_2022.csv")
+PATH_PLANTS <- file.path(DATA_DIR, "us_steel_plants.csv")
+```
+
+```{r}
+#| label: basemap-2019
+#| include: false
+#| warning: false
+#| message: false
+
+# Lower 48 only (drop AK/HI/PR)
+states_sf <- states(year = 2019, cb = TRUE) %>%
+  filter(!STATEFP %in% c("02","15","72")) %>%
+  st_transform(5070)
+
+counties_sf <- counties(year = 2019, cb = TRUE) %>%
+  filter(!STATEFP %in% c("02","15","72")) %>%
+  transmute(
+    fips = GEOID,
+    STATEFP, COUNTYFP, NAME,
+    geometry
+  ) %>%
+  st_transform(5070)
+
+stopifnot(inherits(counties_sf, "sf"))
+stopifnot("fips" %in% names(counties_sf))
+```
+
+```{r}
+#| label: load-core-data
+#| include: false
+#| warning: false
+#| message: false
+
+# 3.1 Master panel (county only)
+panel_county <- read_dta(PATH_PANEL) %>%
+  filter(geotype == "county") %>%
+  mutate(
+    fips = str_pad(as.character(fips), 5, pad = "0"),
+    year = as.integer(year)
+  )
+
+# 3.2 IRA comments features (2022)
+comm_2022 <- read_csv(PATH_COMM22, show_col_types = FALSE) %>%
+  transmute(
+    fips = str_pad(as.character(county_fips), 5, pad = "0"),
+    year = 2022L,
+    comm_total       = total_comments,
+    comm_noise       = noise_count,
+    noise_share      = noise_share,
+    n_clusters       = num_clusters_ex_noise,
+    max_cluster_share = max_cluster_share
+  )
+```
+
+
+```{r}
+#| label: build-panel-sf
+#| include: false
+#| warning: false
+#| message: false
+
+# Logic: use 2021 covariates as lagged controls, relabel them as year=2022, then merge 2022 comment outcomes.
+
+# 1) geometry base + all county-year rows
+panel_geo <- counties_sf %>%
+  left_join(panel_county, by = "fips")
+
+# 2) keep 2021 covariates, relabel as "2022 controls"
+panel_2021_as_2022 <- panel_geo %>%
+  filter(year == 2021) %>%
+  mutate(
+    # steel VC layoff rate (you already have level); build log(1+x)
+    ln_steel_vc_layoff_rate = log1p(steel_vc_layoff_rate_tot),
+    year = 2022L
+  )
+
+# 3) merge 2022 comment outcomes
+panel_sf <- panel_2021_as_2022 %>%
+  left_join(comm_2022, by = c("fips","year"))
+
+# Sanity checks
+stopifnot(inherits(panel_sf, "sf"))
+stopifnot(all(c("comm_total","population","ln_steel_vc_layoff_rate") %in% names(panel_sf)))
+
+```
+
+
+## I. Introduction
+
+The Inflation Reduction Act (IRA) has triggered one of the largest waves of U.S. industrial-policy rulemakings in decades, and much of the contestation over implementation plays out in **notice-and-comment**. Yet the geography of participation is rarely treated as an object of analysis. Participation is typically summarized as national totals or stakeholder lists, even though both the **economic stakes** (e.g., heavy-industry exposure) and the **capacity to engage** (e.g., workforce trainings) are uneven across country. This project asks a simple place-based question: **when the IRA is being written into rules, which counties “show up” in the comments, and do counties exposed to steel employment shocks participate differently from similar counties elsewhere?**
+
+I study this question using a county-level linkage between (i) **IRA public comment participation intensity in 2022** and (ii) multiple measures of **steel-related exposure**, including a lagged steel value-chain layoff proxy and a “steel footprint” defined by plant locations and contiguity-based corridor membership. Conceptually, I treat commenting as a spatially distributed form of policy engagement: rather than claiming which specific letters altered regulatory text (a hard attribution problem noted in @xing-etal-2023-tracing), I focus on **observable intensity**—a per-capita rate and a relative-risk (“excess commenting”) measure that identifies counties that comment **more than expected given population size**.
+
+Methodologically, the project is explicitly spatial. County outcomes are not independent draws: both participation and industrial structure exhibit geographic clustering. I therefore (1) diagnose clustering using **Global Moran’s I** and **LISA** maps, and (2) estimate baseline **OLS** models alongside **spatial lag (SAR)** specifications when residual spatial autocorrelation remains. This design makes “space” part of the identification strategy in a modest but important way: if spatial dependence is strong, inference that ignores it can overstate precision or misattribute region-wide patterns to local covariates.
+
+The empirical strategy centers on two hypotheses. First, motivated by work linking economic disruption to political behavior (e.g., @margalit_politicalresponses_2019), I test whether **steel value-chain layoff exposure** predicts higher (or lower) excess commenting. Second, motivated by place-based political economy and spatially concentrated shocks (e.g., @autor_importingpolarization_2020), I test whether a **steel corridor**—a multi-county footprint that extends beyond plant-hosting counties—better predicts participation than point measures like “has a plant” or plant counts. As a complementary “capacity” channel, I also incorporate **Registered Apprenticeship intensity** as a proxy for workforce-development infrastructure and construct a policy-relevant 2×2 typology (High/Low layoffs × High/Low apprenticeship intensity) to describe “high shock × low capacity” versus “high shock × high capacity” places.
+
+The main takeaways are: First, IRA commenting intensity is **strongly spatially clustered**, and spatial models materially improve fit and residual diagnostics relative to OLS. Second, the bivariate correlation between layoffs and commenting weakens substantially once baseline county controls are included, suggesting that **layoffs alone do not robustly explain** excess commenting conditional on local socioeconomic structure. Third, a place-based **steel corridor** measure is more informative than plant-hosting indicators: corridor membership is associated with higher excess commenting even after accounting for spatial spillovers, while a broad “industrial belt” comparator (manufacturing-share HH clusters) provides a weaker explanation. Together, these findings suggest that “local voices” in IRA rulemaking are patterned less by single-county plant presence and more by **regional industrial geography** and **spatial spillovers**, a perspective that motivates treating rulemaking participation as a spatial political-economy outcome rather than a purely national stakeholder aggregate.
+
+
+## II. Literature Review
+
+@xing-etal-2023-tracing motivates treating notice-and-comment participation as a meaningful policy signal at scale. The authors emphasize both the size of the corpus and the attribution problem: U.S. regulators **receive over one million comment letters each year** and, crucially, **are required to respond to comments but they do not have to specify which comments they are addressing**.
+
+Taken together, this supports an empirical strategy that focuses on **observable participation intensity** (e.g., per-capita rates and relative-risk style excess-commenting measures) rather than attempting to claim which specific comments “caused” specific regulatory text changes.
+
+A second strand of literatue links local economic disruption to political attitudes and behavior, providing the rationale for testing whether steel-related layoffs predict elevated policy engagement (or disengagement). In @margalit_politicalresponses_2019, economic shocks are framed as plausibly consequential for politics because **job loss and economic decline** can have **significant and theoretically predictable effects on political attitudes and behavior**. This brings out the layoff-shock hypothesis that, if dislocation changes attitudes/participation, then counties experiencing larger steel value-chain disruption should exhibit systematically different commenting intensity than otherwise similar counties.
+
+A third strand of literature emphasizes that political behavior and representation can shift in systematically **place-based** ways when exposure to economic change is geographically concentrated. In @autor_importingpolarization_2020, trade exposure is explicitly studied as a local-labor-market shock, and the authors report that **trade-exposed local labor markets** exhibit **growing ideological polarization**, including that **elected officials** from such places **become more politically extreme**. A Brookings analysis notes that **American manufacturing is highly differentiated geographically**, with large differences **across states, metros, and counties**. This study indicates that manufacturing and heavy-industry precence should be treated as spatially clustered rather than evenly distributed.
+
+Together, these literatures motivate (i) testing steel “footprint” measures (has-plant, distance, and corridor membership) as predictors of excess commenting, and (ii) explicitly diagnosing and modeling spatial dependence rather than assuming counties are independent draws.
+
+Finally, workforce development provides a policy-relevant “response”. U.S. Department of Labor Apprenticeship program define apprenticeships as combining **paid on-the-job training** with **classroom instruction** to **prepare workers for highly-skilled careers**. This definition makes apprenticeship a plausible county-level proxy to the attempt of absorbing workers layoffs after, thus it becomes natural to test whether (a) apprenticeship intensity itself clusters spatially, (b) apprenticeship intensity aligns with steel employment shock exposure, and (c) commenting outcomes differ across “high shock × low capacity” versus “high shock × high capacity” places.
+
+
+## III. Methodology
+
+### 1. Overall design and pipeline
+
+This project builds a **county-level 2022 cross-section dataset** that links **IRA comment participation intensity** from regulations.gov to (i) **steel value-chain layoff exposure** and (ii) a **place-based steel “footprint”** (plants, distance, and corridor membership). 
+> The workflow is as follows: assemble the county spatial panel → construct commenting outcomes → construct steel exposure and footprint variables → diagnose spatial dependence (Global Moran’s I and LISA) → estimate OLS baselines → estimate SAR models when residual spatial autocorrelation remains → compare model fit (AIC) and interpret results.
+
+**Key objects:**
+
+* Outcome: `log_comm_rr`, `log_comm_rate`
+* Shock exposure: `ln_steel_vc_layoff_rate`
+* Footprint: `has_plant`, `n_plants_cty`, `dist_to_steel_km`, `steel_corridor_nb`
+* Comparator geography: `industrial_belt`
+* Capacity: `ln_appr_all`
+* Spatial weights: `nb_*` / `lw_*`
+
+
+### 2. Data construction, timing, and alignment
+
+I use **Lower-48 county geometries** from TIGRIS (2019 cartographic boundary) and project all spatial objects to **EPSG:5070** for distance calculations and neighbor construction. The core covariates come from the master county panel, while the commenting outcomes come from the 2022 IRA comment feature file. To reduce simultaneity between 2022 commenting and local conditions, I then **lag controls and exposure** by taking **2021 county covariates** (including steel value-chain layoff exposure) and relabeling them as the “2022 control set,” then merging in **2022 commenting outcomes**. All analytic regressions are run on samples that drop empty geometries and enforce complete cases for the variables used in the specific model.
+
+**Key objects:**
+
+* Spatial base: `counties_sf` (EPSG:5070), `panel_sf`
+* Lagged design: 2021 covariates → `year = 2022L` controls
+* Outcomes file (2022): `comm_total`, `noise_share`, `n_clusters`, `max_cluster_share`
+* Sample enforcement: `!st_is_empty(geometry)`, `complete.cases(...)`
+
+
+
+### 3. Outcome measures: participation intensity (2022)
+
+The main dependent variable is an “excess commenting” measure that treats comment as a form of **spatially distributed participation intensity**. I construct two outcomes. First, the **per-capita comment rate** is `comm_rate = comm_total / population`, transformed as `log_comm_rate = log1p(comm_rate)` to reduce skew. Second, the primary outcome is a **relative-risk (RR)** measure under a constant-risk baseline: I estimate a national expected rate `alpha_hat = Σcomments / Σpopulation`, compute expected county comments `comm_expected = alpha_hat * population`, and form a smoothed RR `(comm_total + 0.5) / (comm_expected + 0.5)`, then take logs: `log_comm_rr = log(comm_rr)`. This approach focuses on **where participation is unusually high relative to population size**, rather than raw counts alone.
+
+**Key objects:**
+
+* `comm_total`, `population`
+* `comm_rate`, `log_comm_rate`
+* `alpha_hat`, `comm_expected`, `comm_rr`, `log_comm_rr`
+
+
+
+### 4. Steel exposure and “steel footprint” measures
+
+To operationalize steel-related local exposure, I use both an **economic shock proxy** and a set of **place-based steel presence proxies**. The shock proxy is the county’s steel value-chain layoff exposure, transformed as `ln_steel_vc_layoff_rate = log1p(steel_vc_layoff_rate_tot)` and treated as the key predictor in H1. The footprint measures are built by mapping steel plant points to counties: I compute whether a county hosts any plant (`has_plant`) and how many (`n_plants_cty`), compute the distance from each county centroid to the nearest plant (`dist_to_steel_km`), and define a corridor indicator (`steel_corridor_nb`) using queen contiguity neighbor-expansion around plant counties to capture multi-county industrial regions rather than point locations only.
+
+**Key objects:**
+
+* Shock: `steel_vc_layoff_rate_tot`, `ln_steel_vc_layoff_rate`
+* Plants: `has_plant`, `n_plants_cty`
+* Distance: `dist_to_steel_km`
+* Corridor: `steel_corridor_nb`
+
+
+
+### 5. Spatial dependence diagnostics (Moran’s I and LISA)
+
+Because counties are not independent in space, I explicitly diagnose spatial clustering before and after modeling. For each target variable (e.g., `log_comm_rr`, `log_comm_rate`, `ln_steel_vc_layoff_rate`, and `ln_appr_all`), I build a **queen contiguity neighbor graph** (`poly2nb`) and a row-standardized weights list (`nb2listw`, style `"W"`). I compute **Global Moran’s I** to test for overall spatial autocorrelation and compute **LISA (local Moran’s I)** to identify spatial clusters and outliers (HH/HL/LH/LL) at p<0.05. After regressions, I also compute Moran’s I on **model residuals** to check whether spatial dependence remains and therefore whether a spatial model is warranted.
+
+**Key objects:**
+
+* Weights: `nb_* = poly2nb(...)`, `lw_* = nb2listw(nb_*, style="W")`
+* Global test: `moran.test(x, lw_*, zero.policy=TRUE)`
+* Local clusters: `localmoran(x, lw_*, ...)` → `cluster_*` (HH/HL/LH/LL)
+
+
+### 6. Hypothesis testing models: OLS and SAR (spatial lag)
+
+I estimate OLS as the baseline because it is interpretable and provides a standard reference, then use SAR (spatial lag) when diagnostics indicate meaningful spatial dependence. For H1 (comments ~ layoffs), I estimate both a **bivariate OLS** (`log_comm_rr ~ ln_steel_vc_layoff_rate`) and a **controlled OLS** including logged size and socio-economic controls. For H2 (comments ~ steel footprint), I estimate OLS models for plant presence/count, distance, and corridor membership, and estimate a SAR model for corridor-based effects to account for spatial spillovers. SAR models are estimated using `lagsarlm(..., method="eigen")` with the same W matrix defined on the regression sample. I compare OLS vs SAR using **AIC** and report Moran’s I on residuals for both, treating SAR as the preferred specification when it better absorbs spatial autocorrelation and improves fit.
+
+**Key objects:**
+
+* OLS: `lm(..., na.action = na.fail)`
+* SAR: `lagsarlm(..., listw = lw_*, method="eigen", zero.policy=TRUE)`
+* Fit comparison: `AIC(ols)`, `AIC(sar)`
+* Residual check: `moran.test(residuals(model), lw_*, ...)`
+
+
+### 7. Comparator geography: industrial belt falsification-style test
+
+To distinguish “steel-specific” spatial structure from broader manufacturing clustering, I construct an **industrial belt indicator** based on manufacturing employment share and LISA HH clustering. I define `manu_share = emp_manu / emp_total`, compute LISA on `manu_share`, and label counties as `industrial_belt = TRUE` when they are significant (p<0.05) and in an HH cluster. I then test whether `industrial_belt` predicts `log_comm_rr` in a SAR model. If the belt indicator is weak relative to steel footprint measures, it supports interpreting effects as more steel-linked rather than generic “manufacturing region” participation.
+
+**Key objects:**
+
+* `manu_share`, `industrial_belt`
+* Comparator model: `log_comm_rr ~ industrial_belt + controls` (SAR)
+
+
+### 8. Apprenticeship capacity and layoff–capacity typology
+
+I treat Registered Apprenticeship activity as a county-level proxy for workforce development capacity by constructing `ln_appr_all = log1p(apprenticeship_count)` using the available apprenticeship column in the panel (e.g., `active_all_adjust` or `total_all_apprentice_num`). I first map and diagnose spatial clustering of apprenticeship intensity (Global Moran’s I and LISA). I then test whether apprenticeship intensity is associated with steel exposure and footprint variables using OLS and SAR. Finally, to produce an interpretable policy-relevant classification, I create a **2×2 typology** using median splits of layoffs (`ln_steel_vc_layoff_rate`) and apprenticeship intensity (`ln_appr_all`): High layoff × High RA, High layoff × Low RA, Low layoff × High RA, Low layoff × Low RA. I map the typology and test whether commenting outcomes differ across types using summary comparisons and regression models.
+
+**Key objects:**
+
+* Capacity: `ln_appr_all`
+* Typology: `appr_layoff_type` (4-category factor)
+* Outcomes compared across types: `log_comm_rr`, `log_comm_rate`, `noise_share`
+
+
+### 9. Text as Data pipeline: ZIP geocoding → SBERT embeddings → DBSCAN de-duplication → LDA
+
+This project uses a full “text as data” workflow to convert unstructured Regulations.gov comments into county-linked text objects and interpretable topic portraits that can be compared across place types.
+
+> combinedText from regulations.gov comments
+  → ZIP extraction from text (regex; state-abbreviation normalization)
+  → ZIP cleaning → zip5
+  → HUD ZIP→COUNTY crosswalk (choose primary county by max RES_RATIO)
+  → county_fips (5-digit) appended to each comment
+  → SBERT embeddings on combinedText
+  → DBSCAN on embeddings (semantic near-duplicate / campaign detection)
+  → de-dup corpus (keep all cluster = -1; keep 1 representative per cluster)
+  → LDA topic modeling (K topics; e.g., K=30)
+  → topic portraits by Layoffs × Apprenticeships typology
+
+**9.1 Geocoding from text: extracting ZIP and crosswalking to county FIPS.**
+Before computing embeddings, I assign each comment to a county by extracting a ZIP code from `combinedText`. I use prioritized regular expressions to detect the first plausible ZIP mention (e.g., `City, ST ZIP`, `ST ZIP`, spaced ZIP variants, and a 5-digit / ZIP+4 fallback), after normalizing noisy state abbreviations (e.g., “D.C.” → “DC”) to improve match rates. Extracted ZIP strings are cleaned into a standardized 5-digit ZIP (`zip5`) by removing ZIP+4 suffixes, whitespace, and non-digit characters, and left-padding leading zeros when needed. I then map `zip5` to a county using the HUD ZIP–COUNTY crosswalk (ZIP_COUNTY_122023). Because a ZIP may span multiple counties, I assign each ZIP to a single “primary” county by selecting the county with the highest residential share (`RES_RATIO`). This yields a standardized 5-digit `county_fips` attached to each comment for county-level aggregation and spatial joining.
+
+**9.2 Semantic representations: SBERT embeddings.**
+I compute SBERT embeddings for each comment’s `combinedText` to obtain dense semantic vectors that capture meaning beyond exact word overlap. These embeddings provide the feature space for identifying semantically near-duplicate submissions that likely reflect organized or template-based campaigns.
+
+**9.3 De-duplication: DBSCAN clustering on embeddings.**
+Using the SBERT vectors, I run DBSCAN to cluster comments that are highly similar in semantic space. DBSCAN labels unique/unclustered submissions as `-1` and assigns repeated/template submissions to numbered clusters. For downstream content analysis, I construct a de-clustered corpus by keeping **all** `-1` comments and retaining **one representative “signature” comment per non-`-1` cluster**, reducing the dominance of mass-form letters while preserving distinct arguments.
+
+**9.4 Topic modeling: LDA on the de-clustered corpus (K topics).**
+I fit Latent Dirichlet Allocation (LDA) on the de-clustered corpus to summarize recurring themes in an interpretable way. LDA is used descriptively—as a topic “portrait” of what issues and frames appear in comments—rather than as causal evidence about regulatory outcomes. Topics are reported using top-probability words (and, when useful, representative documents). I use a fixed topic count for comparability across analyses (e.g., K = 30).
+
+**9.5 Comparing discourse across place types (Layoffs × Apprenticeships).**
+Finally, I link text back to geography using `county_fips` and compare topic portraits across the policy-relevant 2×2 layoff–capacity typology (High/Low layoffs × High/Low apprenticeship intensity). This text-as-data layer complements the spatial econometric results by testing whether counties that differ in shock exposure and workforce capacity also differ in how they frame what is at stake in IRA rulemaking.
+
+
+
+## IV. Exploratory Data Analysis (EDA)
+
+### 1. IRA comments
+
+#### 1.1  IRA comments first-order: Maps of outcomes
+
+This section establishes the two baseline outcome measures used throughout the analysis and visualizes their county-level geographic distribution. 
+
+Two outcomes:
+
+- **Per-capita comment rate**: `comm_rate = comm_total / population`, then `log_comm_rate = log(1 + comm_rate)`
+
+- **Relative risk (RR)** under a constant-risk baseline:  
+   - estimate a national constant rate: `alpha_hat = Σcomments / Σpopulation`  
+   - expected comments: `comm_expected = alpha_hat * population`  
+   - smoothed RR: `(comm_total + 0.5) / (comm_expected + 0.5)`  
+   - `log_comm_rr = log(comm_rr)`
+
+```{r}
+#| label: build-comment-outcomes
+#| warning: false
+#| message: false
+
+alpha_hat <- sum(panel_sf$comm_total, na.rm = TRUE) / sum(panel_sf$population, na.rm = TRUE)
+
+panel_sf <- panel_sf %>%
+  mutate(
+    comm_rate     = comm_total / population,
+    log_comm_rate = log1p(comm_rate),
+
+    comm_expected = alpha_hat * population,
+    comm_rr       = (comm_total + 0.5) / (comm_expected + 0.5),
+    log_comm_rr   = log(comm_rr)
+  )
+
+# summary(panel_sf$log_comm_rate)
+# summary(panel_sf$log_comm_rr)
+```
+
+Next, I prepare an interactive map view by transforming geometries to WGS84 (EPSG:4326). I also drop Washington, DC (FIPS prefix “11”), since the concentration of organizational submitters in the area can dominate the visualization and create an biased “hot spot” driven by administrative noise rather than local participation patterns.
+
+```{r}
+#| label: map-views-4326
+#| include: false
+
+# Reusable Leaflet views (temporary)
+panel_4326  <- panel_sf %>% filter(substr(fips,1,2) != "11") %>% st_transform(4326)
+states_4326 <- states_sf %>% st_transform(4326)
+
+library(mapview)
+# mapviewOptions(fgb = FALSE)
+options(mapview.leaflet.options = leaflet::leafletOptions(preferCanvas = TRUE))
+mapviewOptions(fgb = TRUE)
+```
+
+I then plot both outcomes: 
+
+```{r}
+#| label: map-log-comm-rate
+#| warning: false
+#| message: false
+
+mapview(
+  panel_4326, zcol = "log_comm_rate",
+  layer.name = "log(Comments per person + 1)", legend = TRUE,
+  color = "#ffffff", lwd = 0.8, alpha = 0.3
+)
+```
+
+```{r}
+#| label: map-log-comm-rr
+#| warning: false
+#| message: false
+
+mapview(
+  panel_4326, zcol = "log_comm_rr",
+  layer.name = "log(RR)", legend = TRUE,
+  color = "#ffffff", lwd = 0.8, alpha = 0.3
+)
+```
+
+
+#### 1.2  IRA comments second-order: Global Moran’s I + LISA
+
+```{r}
+#| label: ira-spatial-setup
+#| include: false
+
+panel_sp <- panel_sf %>%
+  filter(!st_is_empty(geometry)) %>%
+  filter(substr(fips, 1, 2) != "11") %>% # drop DC (optional)
+  filter(!is.na(log_comm_rr), !is.na(log_comm_rate))
+
+nb_ira <- poly2nb(panel_sp, queen = TRUE)
+lw_ira <- nb2listw(nb_ira, style = "W", zero.policy = TRUE)
+```
+
+To test whether IRA commenting outcomes are spatially clustered (rather than geographically random), I run Global Moran’s I using a queen-contiguity weights matrix $W$ built from county polygons (with “no-neighbour” observations dropped by the test routine).
+
+```{r}
+#| label: ira-global-moran
+#| message: false
+#| warning: false
+
+moran_log_rr   <- moran.test(panel_sp$log_comm_rr,   lw_ira, zero.policy = TRUE)
+moran_log_rate <- moran.test(panel_sp$log_comm_rate, lw_ira, zero.policy = TRUE)
+
+# moran_log_rr
+# moran_log_rate
+```
+
+The results show strong, positive spatial autocorrelation in both measures:
+
+For log RR (`log_comm_rr`), **Moran’s I = 0.291** with a **z-score = 14.63** and **p < 2.2e−16**, indicating a pronounced tendency for counties with high (or low) excess-commenting risk to be located near counties with similarly high (or low) values.
+
+For log per-capita rate (`log_comm_rate`), **Moran’s I = 0.102** with a **z-score = 6.64** and **p = 1.557e−11**, still clearly significant but weaker than the RR-based outcome.
+
+
+```{r}
+#| label: ira-lisa-logrr
+#| message: false
+#| warning: false
+
+x <- as.numeric(panel_sp$log_comm_rr)
+local_rr <- localmoran(x, lw_ira, zero.policy = TRUE)
+
+panel_sp <- panel_sp %>%
+  mutate(
+    Z_local = local_rr[, "Z.Ii"],
+    p_local = 2 * pnorm(-abs(Z_local)),
+    sig_rr  = p_local < 0.05,
+    lag_x   = lag.listw(lw_ira, x, zero.policy = TRUE),
+
+    x_hi   = x    >= mean(x, na.rm = TRUE),
+    lag_hi = lag_x >= mean(lag_x, na.rm = TRUE),
+
+    cluster_rr_raw = case_when(
+      x_hi  & lag_hi  ~ "HH",
+      x_hi  & !lag_hi ~ "HL",
+      !x_hi & lag_hi  ~ "LH",
+      !x_hi & !lag_hi ~ "LL",
+      TRUE            ~ NA_character_
+    )
+  )
+
+lisa_df <- panel_sp %>%
+  st_drop_geometry() %>%
+  select(fips, sig_rr, cluster_rr_raw, p_local)
+
+panel_sf <- panel_sf %>%
+  left_join(lisa_df, by = "fips") %>%
+  mutate(
+    cluster_rr = case_when(
+      sig_rr & cluster_rr_raw %in% c("HH","HL","LH","LL") ~ cluster_rr_raw,
+      TRUE ~ NA_character_
+    ),
+    cluster_rr = factor(cluster_rr, levels = c("HH","HL","LH","LL"))
+  )
+
+# panel_sf %>%
+#   st_drop_geometry() %>%
+#   count(cluster_rr, sort = TRUE)
+```
+
+Given this global clustering, I then compute LISA for `log_comm_rr` and classify statistically significant counties (p < 0.05) into the standard four local spatial association types. In this sample, the LISA breakdown is:
+
+* HH: 65 counties
+* LL: 106 counties
+* HL: 18 counties
+* LH: 13 counties
+* Not significant (NA): 2906 counties
+
+So only **202 counties** fall into statistically significant local clusters/outliers, while the large majority are not locally significant at the 5% level. Mapping these LISA categories (and setting non-significant counties to transparent) highlights where RR “hot spots” (HH) and “cold spots” (LL) concentrate, consistent with the strong global Moran’s I signal above.
+
+
+Finally, I map the statistically significant LISA clusters, leaving non-significant counties transparent.
+
+```{r}
+#| label: map-lisa-logrr
+#| warning: false
+#| message: false
+
+panel_lisa_4326 <- panel_sf %>%
+  filter(substr(fips, 1, 2) != "11") %>%
+  st_transform(4326)
+
+mapviewOptions(
+  basemaps = c("CartoDB.Positron"),
+  fgb = TRUE
+)
+
+mapview(
+  panel_lisa_4326,
+  zcol = "cluster_rr",
+  layer.name = "LISA clusters (log RR, p<0.05)",
+  legend = TRUE,
+  na.color = "transparent",
+  color = "#7c7c7cff", lwd = 0.8, alpha = 0.3
+)
+
+```
+
+
+### 2. Steel value-chain layoffs
+
+#### 2.1 Steel layoffs first-order: Map of log steel VC layoff rate
+
+To visualize the geographic distribution of steel value-chain disruption, I mapped the county-level log steel value-chain layoff rate. This layoff measure is taken from 2021 and treated as lagged exposure for 2022 to align with the year of IRA comment outcomes. For interpretability, counties with a layoff rate equal to zero are set to missing in the map so that the display emphasizes where disruption is non-zero rather than compressing the color scale around zeros. The resulting first-order map provides a direct view of whether layoff exposure is spatially clustered and whether it aligns with the spatial patterns observed in excess commenting.
+
+```{r}
+#| label: map-layoff
+#| warning: false
+#| message: false
+
+panel_4326_layoff <- panel_4326 %>%
+  mutate(ln_steel_vc_layoff_rate_map = if_else(ln_steel_vc_layoff_rate == 0, NA_real_, ln_steel_vc_layoff_rate))
+
+mapview(
+  panel_4326_layoff,
+  zcol = "ln_steel_vc_layoff_rate_map",
+  layer.name = "log(steel VC layoff rate, 2021 → lagged for 2022)",
+  color = "#7c7c7cff", lwd = 0.8, alpha = 0.3,
+  legend = TRUE,
+  na.color = "transparent"
+)
+```
+
+
+#### 2.2 Steel layoffs second-order: Global Moran’s I + LISA
+
+Beyond mapping layoffs, I constructed a set of **“steel footprint”** spatial exposure measures based on steel plant locations and county contiguity. I first ingested a plant-level dataset, parsed latitude/longitude coordinates, converted them into an sf point object, and spatially joined plants to counties to count how many plants fall within each county. This produces a county indicator for whether a county hosts a plant and the number of plants located there.
+
+Next, I computed each county’s distance to the nearest steel plant. To do so, I took county centroids in the projected CRS (EPSG:5070), calculated distances from each centroid to all plant points, and retained the minimum distance (converted to kilometers). This gives a continuous proximity-based exposure measure.
+
+Finally, I defined a **steel “corridor”** as a neighborhood-expanded footprint using queen contiguity: counties with at least one plant form a core set, and I added their immediate neighbors as the corridor. To capture stronger hubs, I separately identified counties with at least two plants and expanded outward by two neighbor steps. The corridor indicator flags counties that are either plant-hosting counties or adjacent to them through this contiguity expansion, capturing the idea that steel-related economic activity and its spillovers may extend beyond administrative boundaries.
+
+These plant-based measures are merged back into the main county dataset (panel_sp3) and used later for hypothesis tests (OLS/SAR) and spatial diagnostics (e.g., Moran’s I, LISA).
+
+**Key variables created:**
+
+* n_plants_cty (count of steel plants in county)
+* has_plant (whether county has ≥1 plant)
+* dist_to_steel_km (distance from county centroid to nearest plant, km)
+* steel_corridor_nb (neighbor-expanded corridor indicator based on contiguity)
+
+
+```{r}
+#| label: steel-plants-overlay
+#| include: false
+#| warning: false
+#| message: false
+
+# A) county base (same as panel, but pure geometry)
+cty_base <- counties_sf %>% filter(substr(fips, 1, 2) != "11")
+
+# B) read plant points and parse coordinates
+steel_raw <- read_csv(PATH_PLANTS, show_col_types = FALSE) %>%
+  rename(Country_Area = `Country/Area`)
+
+steel_pts <- steel_raw %>%
+  separate(Coordinates, into = c("lat", "lon"), sep = ",", remove = FALSE) %>%
+  mutate(
+    lat = as.numeric(str_trim(lat)),
+    lon = as.numeric(str_trim(lon)),
+    # fix sign if needed (your previous logic)
+    lon = if_else(lon > 0 & Country_Area == "United States", -lon, lon)
+  )
+
+steel_sf_ll <- st_as_sf(steel_pts, coords = c("lon", "lat"), crs = 4326)
+steel_sf    <- st_transform(steel_sf_ll, st_crs(cty_base))
+
+# C) assign plant -> county fips
+steel_cty <- st_join(steel_sf, cty_base %>% select(fips), left = FALSE)
+
+plants_by_cty <- steel_cty %>%
+  st_drop_geometry() %>%
+  count(fips, name = "n_plants_cty")
+
+cty_plants <- cty_base %>%
+  left_join(plants_by_cty, by = "fips") %>%
+  mutate(
+    n_plants_cty = replace_na(n_plants_cty, 0L),
+    has_plant    = n_plants_cty > 0
+  )
+
+# D) distance to nearest plant (km) using centroids (EPSG:5070 meters)
+cty_centroids <- st_centroid(cty_plants)
+dist_mat <- st_distance(cty_centroids, steel_sf) # units: meters (because 5070)
+min_dist <- apply(dist_mat, 1, min)
+
+cty_plants <- cty_plants %>%
+  mutate(dist_to_steel_km = as.numeric(min_dist) / 1000)
+
+# E) corridor (NB-expanded)
+nb_comm_plant <- poly2nb(cty_plants, queen = TRUE)
+
+core_1 <- which(cty_plants$n_plants_cty >= 1)
+core_2 <- which(cty_plants$n_plants_cty >= 2)
+
+get_neighbors <- function(idx, nb_obj) unique(unlist(nb_obj[idx]))
+
+nbr_1   <- get_neighbors(core_1, nb_comm_plant)
+nbr_2_1 <- get_neighbors(core_2, nb_comm_plant)
+nbr_2_2 <- get_neighbors(nbr_2_1, nb_comm_plant)
+
+corridor_ids <- sort(unique(c(core_1, nbr_1, core_2, nbr_2_1, nbr_2_2)))
+
+cty_plants <- cty_plants %>%
+  mutate(steel_corridor_nb = row_number() %in% corridor_ids)
+
+# Non-sf overlay table
+steel_overlay_df <- cty_plants %>%
+  st_drop_geometry() %>%
+  select(fips, n_plants_cty, has_plant, dist_to_steel_km, steel_corridor_nb)
+```
+
+
+```{r}
+#| label: merge-steel-overlay
+#| include: false
+
+panel_sp3 <- panel_sf %>%
+  left_join(steel_overlay_df, by = "fips")
+
+stopifnot(all(c("has_plant","dist_to_steel_km","steel_corridor_nb") %in% names(panel_sp3)))
+```
+
+
+#### 2.3  Steel layoffs second-order: Map of steel plants + corridor
+
+Next, I visualize the geography of U.S. steel production by overlaying steel plant point locations on top of a steel “corridor” polygon layer. The corridor is constructed using an NB-expansion rule: starting from counties that contain at least one plant (“core”), I iteratively add their contiguity neighbors to capture adjacent counties that plausibly share the same heavy-industry spatial footprint. The plant points are plotted on top.
+
+```{r}
+#| label: map-steel-corridor-overlay
+#| warning: false
+#| message: false
+
+corridor_4326 <- cty_plants %>% st_transform(4326) %>% filter(steel_corridor_nb)
+plants_4326   <- steel_sf_ll %>% st_transform(4326)
+
+map_corridor <- mapview(
+  corridor_4326,
+  layer.name    = "Steel corridor (NB-expanded)",
+  col.regions   = "gold",
+  alpha.regions = 0.7,
+  legend        = TRUE,
+  color = "#7c7c7cff", lwd = 0.8, alpha = 0.3
+)
+
+map_plants <- mapview(
+  plants_4326,
+  layer.name  = "Steel plants",
+  col.regions = "purple",
+  alpha       = 0.9,
+  cex         = 2
+)
+
+map_corridor + map_plants
+```
+
+
+### 3. Industrial belt identification
+
+To separate “steel-specific” spatial patterns from broader manufacturing concentration, I construct an industrial belt indicator based on county manufacturing intensity. I first compute manufacturing employment share as `manu_share = emp_manu / emp_total` (dropping counties where `emp_total <= 0` or where `manu_share` is missing).
+
+```{r}
+#| label: industrial-belt-lisa
+#| include: false
+#| warning: false
+#| message: false
+
+panel_sp3_ind <- panel_sp3 %>%
+  mutate(
+    manu_share  = if_else(emp_total > 0, emp_manu / emp_total, NA_real_),
+    steel_share = if_else(emp_total > 0, emp_steel / emp_total, NA_real_)
+  )
+
+# For LISA we need a complete numeric vector
+panel_sp3_ind_clean <- panel_sp3_ind %>%
+  filter(!st_is_empty(geometry)) %>%
+  filter(!is.na(manu_share))
+
+nb_ind <- poly2nb(panel_sp3_ind_clean, queen = TRUE)
+lw_ind <- nb2listw(nb_ind, style = "W", zero.policy = TRUE)
+
+x_manu <- as.numeric(panel_sp3_ind_clean$manu_share)
+local_manu <- localmoran(x_manu, lw_ind, zero.policy = TRUE)
+
+panel_sp3_ind_clean <- panel_sp3_ind_clean %>%
+  mutate(
+    Z_manu   = local_manu[, "Z.Ii"],
+    p_manu   = 2 * pnorm(-abs(Z_manu)),
+    sig_manu = p_manu < 0.05,
+    lag_manu = lag.listw(lw_ind, x_manu, zero.policy = TRUE),
+
+    manu_high = manu_share >= mean(manu_share, na.rm = TRUE),
+    lag_high  = lag_manu    >= mean(lag_manu, na.rm = TRUE),
+
+    lisa_manu_raw = case_when(
+      manu_high & lag_high ~ "HH",
+      manu_high & !lag_high ~ "HL",
+      !manu_high & lag_high ~ "LH",
+      TRUE ~ "LL"
+    ),
+
+    industrial_belt = sig_manu & lisa_manu_raw == "HH"
+  )
+
+# Merge belt indicator back to main sf (by fips)
+panel_sp3 <- panel_sp3 %>%
+  left_join(panel_sp3_ind_clean %>% st_drop_geometry() %>% select(fips, industrial_belt),
+            by = "fips") %>%
+  mutate(industrial_belt = replace_na(industrial_belt, FALSE))
+```
+
+I then test for spatial clustering in `manu_share` using a queen-contiguity weights matrix and compute Local Moran’s I (LISA). Each county is classified into the standard LISA quadrants (HH, HL, LH, LL) based on whether its own `manu_share` is above the sample mean and whether the spatial lag of `manu_share` is above the sample mean. Finally, I define `industrial_belt = TRUE` only for counties that are both statistically significant at p < 0.05 and fall into the **High–High (HH)** quadrant—i.e., counties with high manufacturing share surrounded by other high-manufacturing-share counties.
+
+Finally, I map the industrial belt counties to visualize their spatial distribution.
+
+```{r}
+#| label: map-industrial-belt
+#| warning: false
+#| message: false
+
+base_ind <- mapview(
+  panel_sp3 %>% st_transform(4326),
+  col.regions   = "grey90",
+  alpha.regions = 0.12,
+  layer.name    = "Counties (analysis sample)",
+  legend        = FALSE,
+  color = "#7c7c7cff", lwd = 0.8, alpha = 0.3
+)
+
+belt_hh <- panel_sp3 %>% filter(industrial_belt) %>% st_transform(4326)
+
+map_belt <- mapview(
+  belt_hh,
+  col.regions   = "orange",
+  alpha.regions = 0.9,
+  layer.name    = "Industrial belt (LISA-HH on manu_share, p<0.05)",
+  legend        = TRUE,
+  color = "#7c7c7cff", lwd = 0.6, alpha = 0.2
+)
+
+base_ind + map_belt
+```
+
+### 4. Apprenticeship intensity
+
+```{r}
+#| label: build-ln-appr
+#| include: false
+#| warning: false
+#| message: false
+
+# if (!("ln_appr_all" %in% names(panel_sp3))) {
+#   if ("total_all_apprentice_num" %in% names(panel_sp3)) {
+#     panel_sp3 <- panel_sp3 %>% mutate(ln_appr_all = log1p(total_all_apprentice_num))
+#   } else if ("active_all_adjust" %in% names(panel_sp3)) {
+#     panel_sp3 <- panel_sp3 %>% mutate(ln_appr_all = log1p(active_all_adjust))
+#   } else {
+#     stop("No apprenticeship raw column found (total_all_apprentice_num or active_all_adjust).")
+#   }
+# }
+```
+
+This section treats Registered Apprenticeship intensity as a county-level proxy for local workforce-development capacity. I operationalize apprenticeship activity as `ln_appr_all = log(1 + apprenticeships)` (constructed earlier) and visualize its geographic distribution, then test whether apprenticeship intensity is spatially clustered.
+
+I begin with a first-order map of `ln_appr_all` at the county level, and overlay state boundaries for easier regional interpretation.
+
+```{r}
+#| label: map-appr-firstorder
+#| warning: false
+#| message: false
+
+if (!"ln_appr_all" %in% names(panel_sp3)) {
+  stopifnot("active_all_adjust" %in% names(panel_sp3))
+  panel_sp3 <- panel_sp3 %>%
+    mutate(ln_appr_all = log(active_all_adjust + 1))
+}
+
+panel_appr_4326 <- panel_sp3 %>%
+  filter(!st_is_empty(geometry), !is.na(ln_appr_all)) %>%
+  st_transform(4326)
+
+mapview(
+  panel_appr_4326,
+  zcol = "ln_appr_all",
+  layer.name = "ln(apprenticeship, all)",
+  legend = TRUE,
+  na.color = "transparent",
+  # county boundaries + fill alpha
+  color = "#7c7c7cff", lwd = 0.8,
+  alpha.regions = 0.5
+) +
+  mapview(
+    st_transform(states_sf, 4326),
+    layer.name = "State boundaries",
+    col.regions = "transparent",
+    alpha.regions = 0,
+    color = "#353535ff", lwd = 0.8,
+    legend = FALSE
+  )
+```
+
+To assess whether apprenticeship intensity exhibits spatial dependence, I compute Global Moran’s I using a queen-contiguity weights matrix built from county polygons. The results indicate extremely strong positive spatial autocorrelation in apprenticeship intensity: **Moran’s I = 0.574** with a **z-score = 51.109** and **p < 2.2e−16**. This implies that counties with high apprenticeship intensity tend to be located near other high-intensity counties (and similarly for low-intensity counties), so apprenticeship capacity is highly spatially clustered rather than geographically random.
+
+Given this strong global clustering, I then compute LISA (local Moran’s I) to identify where apprenticeship “hot spots” and “cold spots” are concentrated. I classify counties into HH/HL/LH/LL based on whether the county’s value and its spatial lag are above/below their respective means, and retain only statistically significant local patterns (p < 0.05). I map these significant cluster types to visualize where apprenticeship capacity is locally concentrated (HH) versus locally depressed (LL), and where local outliers appear (HL/LH).
+
+```{r}
+#| label: appr-moran-lisa
+#| message: false
+#| warning: false
+
+panel_sp3_appr <- panel_sp3 %>%
+  filter(!st_is_empty(geometry), !is.na(ln_appr_all))
+
+nb_appr <- poly2nb(panel_sp3_appr, queen = TRUE)
+lw_appr <- nb2listw(nb_appr, style = "W", zero.policy = TRUE)
+
+moran_appr <- moran.test(as.numeric(panel_sp3_appr$ln_appr_all), lw_appr, zero.policy = TRUE)
+# moran_appr
+
+x_appr <- as.numeric(panel_sp3_appr$ln_appr_all)
+local_appr <- localmoran(x_appr, lw_appr, zero.policy = TRUE)
+lag_appr   <- lag.listw(lw_appr, x_appr, zero.policy = TRUE)
+
+panel_sp3_appr <- panel_sp3_appr %>%
+  mutate(
+    Z_appr   = local_appr[, "Z.Ii"],
+    p_appr   = 2 * pnorm(-abs(Z_appr)),
+    sig_appr = p_appr < 0.05,
+
+    lag_appr = lag_appr,
+    appr_high = ln_appr_all >= mean(ln_appr_all, na.rm = TRUE),
+    lag_high  = lag_appr    >= mean(lag_appr, na.rm = TRUE),
+
+    cluster_appr_raw = case_when(
+      appr_high  &  lag_high ~ "HH",
+      appr_high  & !lag_high ~ "HL",
+      !appr_high &  lag_high ~ "LH",
+      TRUE ~ "LL"
+    ),
+    cluster_appr = if_else(sig_appr, cluster_appr_raw, NA_character_),
+    cluster_appr = factor(cluster_appr, levels = c("HH","HL","LH","LL"))
+  )
+
+panel_appr_lisa_4326 <- panel_sp3_appr %>%
+  filter(!is.na(cluster_appr)) %>%
+  st_transform(4326)
+
+mapview(
+  panel_appr_lisa_4326,
+  zcol = "cluster_appr",
+  layer.name = "LISA clusters (ln_appr_all, p<0.05)",
+  legend = TRUE,
+  na.color = "transparent",
+  color = "#7c7c7cff", lwd = 1.0, alpha = 0.4
+) +
+  mapview(
+    st_transform(states_sf, 4326),
+    layer.name = "State boundaries",
+    col.regions = "transparent", alpha.regions = 0,
+    color = "#7c7c7cff", lwd = 0.8,
+    legend = FALSE
+  )
+
+```
+
+These diagnostics justify treating apprenticeship capacity as a spatially patterned attribute, and in later hypothesis tests, motivate checking residual spatial autocorrelation and using SAR specifications when needed rather than assuming counties are independent draws.
+
+## V. Hypothesis testing
+
+### 1. IRA comments ~ steel layoffs (OLS + SAR)
+
+This section tests whether steel value-chain layoffs predict counties’ IRA comment participation intensity, measured by `log_comm_rr`. Because the EDA results already suggest strong spatial clustering in commenting outcomes, I estimate both conventional **OLS models** and **spatial-lag (SAR) models**, and I use residual Moran’s I / LM tests and AIC to decide whether the spatial specification is warranted.
+
+```{r}
+#| label: h1-setup-reg-ira
+#| include: false
+#| warning: false
+#| message: false
+
+reg_ira <- panel_sf %>%
+  filter(
+    !st_is_empty(geometry),
+    !is.na(log_comm_rr),
+    !is.na(ln_steel_vc_layoff_rate),
+    !is.na(emp_total),
+    !is.na(pcap_income),
+    !is.na(population),
+    !is.na(emp_manu),
+    !is.na(unemployment_rate),
+    !is.na(voteshare_dg)
+  ) %>%
+  mutate(
+    ln_pop       = log(population + 1),
+    ln_emp_total = log(emp_total + 1),
+    ln_pcap_inc  = log(pcap_income + 1),
+    ln_emp_manu  = log(emp_manu + 1),
+    ln_appr_all  = log(active_all_adjust + 1)
+  )
+
+# ---- H1 model formula ----
+form_h1 <- log_comm_rr ~
+  ln_steel_vc_layoff_rate +
+  ln_emp_total +
+  ln_pcap_inc +
+  ln_pop +
+  ln_emp_manu +
+  unemployment_rate +
+  voteshare_dg
+
+vars_h1 <- all.vars(form_h1)
+
+reg_ira_h1 <- reg_ira %>%
+  filter(complete.cases(st_drop_geometry(.)[, vars_h1])) %>%
+  {
+    tmp_df <- st_drop_geometry(.)
+    num_vars <- vars_h1[sapply(tmp_df[, vars_h1, drop = FALSE], is.numeric)]
+    if (length(num_vars) > 0) {
+      filter(., if_all(all_of(num_vars), ~ is.finite(.)))
+    } else {
+      .
+    }
+  }
+
+# Queen contiguity weights (row-standardized W) on the aligned sample
+nb_h1 <- poly2nb(reg_ira_h1, queen = TRUE)
+lw_h1 <- nb2listw(nb_h1, style = "W", zero.policy = TRUE)
+
+```
+
+```{r}
+#| label: h1-ols-bivar
+#| code-fold: true
+#| message: false
+#| warning: false
+
+form_h1_bivar <- log_comm_rr ~ ln_steel_vc_layoff_rate
+
+ols_bivar <- lm(
+  form_h1_bivar,
+  data = reg_ira_h1 %>% st_drop_geometry(),
+  na.action = na.fail
+)
+
+# summary(ols_bivar)
+
+moran_ols_bivar <- moran.test(
+  as.numeric(residuals(ols_bivar)),
+  lw_h1,
+  zero.policy = TRUE
+)
+# moran_ols_bivar
+
+```
+
+```{r}
+#| label: h1-sar-bivar
+#| code-fold: true
+#| message: false
+#| warning: false
+# --- H1: SAR bivariate (no controls), SAME sample + SAME W objects ---
+
+sar_h1_bivar <- lagsarlm(
+  formula     = form_h1_bivar,
+  data        = reg_ira_h1,
+  listw       = lw_h1,
+  method      = "eigen",
+  zero.policy = TRUE
+)
+# summary(sar_h1_bivar)
+
+moran_res_sar_h1_bivar <- moran.test(
+  as.numeric(residuals(sar_h1_bivar)),
+  lw_h1,
+  zero.policy = TRUE
+)
+# moran_res_sar_h1_bivar
+
+# AIC(ols_bivar)
+# AIC(sar_h1_bivar)
+
+```
+
+
+```{r}
+#| label: h1-ols-full
+#| message: false
+#| warning: false
+
+ols_full <- lm(
+  form_h1,
+  data = reg_ira_h1 %>% st_drop_geometry(),
+  na.action = na.fail
+)
+
+# summary(ols_full)
+
+moran_ols_full <- moran.test(as.numeric(residuals(ols_full)), lw_h1, zero.policy = TRUE)
+# moran_ols_full
+```
+
+```{r}
+#| label: h1-sar-full
+#| message: false
+#| warning: false
+
+sar_full <- lagsarlm(
+  formula = form_h1,
+  data        = reg_ira_h1,
+  listw       = lw_h1,
+  method      = "eigen",
+  zero.policy = TRUE
+)
+
+# summary(sar_full)
+
+moran_res_sar_full <- moran.test(as.numeric(residuals(sar_full)), lw_h1, zero.policy = TRUE)
+# moran_res_sar_full
+
+# AIC(ols_full)
+# AIC(sar_full)
+```
+
+
+#### 1.1 Bivariate baseline (no controls)
+
+**H1. Bivariate: `log_comm_rr ~ ln_steel_vc_layoff_rate` (OLS vs SAR)**
+
+The bivariate OLS suggests a positive association between steel value-chain layoff exposure and excess commenting intensity: the layoff coefficient is **2.023** (p = **0.0185**). However, the explanatory power is extremely low (**Adj. R² = 0.00283**), and the OLS residuals are **strongly spatially autocorrelated** (residual Moran’s I = **0.288**, p < 2.2e−16), indicating that the independence assumption is badly violated.
+
+Estimating a spatial-lag (SAR) model on the same sample and the same queen-contiguity weights matrix substantially changes the picture. The layoff coefficient remains positive and statistically significant (**1.755**, p = **0.0264**), and the spatial-lag parameter is large and highly significant (**ρ = 0.379**, p < 2.2e−16), implying strong geographic spillovers in the outcome. Model fit improves sharply (**AIC 3619.1 → 3429.9**). Residual Moran’s I becomes slightly negative and not significant (I = **−0.0239**, p = 0.8789), suggesting that the SAR lag term absorbs most of the spatial clustering left in OLS residuals.
+
+```{r}
+#| label: tab-h1-bivar
+#| message: false
+#| warning: false
+
+# --- helpers (lm + lagsarlm) ---
+tidy_lm <- function(m, model_name) {
+broom::tidy(m) %>%
+mutate(
+model = model_name,
+term  = if_else(term == "(Intercept)", "Intercept", term)
+) %>%
+select(model, term, estimate, std.error, statistic, p.value)
+}
+
+tidy_sar <- function(m, model_name) {
+co <- as.data.frame(summary(m)$Coef)
+co$term <- rownames(co)
+rownames(co) <- NULL
+
+as_tibble(co) %>%
+rename(
+estimate  = Estimate,
+std.error = `Std. Error`,
+statistic = `z value`,
+p.value   = `Pr(>|z|)`
+) %>%
+mutate(
+model = model_name,
+term  = if_else(term == "(Intercept)", "Intercept", term)
+) %>%
+select(model, term, estimate, std.error, statistic, p.value)
+}
+
+fmt_cell <- function(est, se, p) {
+stars <- case_when(
+is.na(p) ~ "",
+p < 0.001 ~ "***",
+p < 0.01  ~ "**",
+p < 0.05  ~ "*",
+p < 0.1   ~ ".",
+TRUE ~ ""
+)
+paste0(
+sprintf("%.3f", est), stars,
+" (", sprintf("%.3f", se), ")"
+)
+}
+
+# --- coefficient table (side-by-side) ---
+
+coef_long <- bind_rows(
+tidy_lm(ols_bivar, "OLS"),
+tidy_sar(sar_h1_bivar, "SAR")
+) %>%
+mutate(cell = fmt_cell(estimate, std.error, p.value)) %>%
+select(model, term, cell)
+
+coef_wide <- coef_long %>%
+pivot_wider(names_from = model, values_from = cell) %>%
+arrange(match(term, c("Intercept","ln_steel_vc_layoff_rate")))
+
+kable(coef_wide, align = "lcc", caption = "H1 Bivariate Regression: OLS vs SAR (cells are Estimate with SE in parentheses; stars by p-value)")
+
+# --- model diagnostics table (SAFE) ---
+moran_ols_bivar <- spdep::moran.test(
+  as.numeric(residuals(ols_bivar)),
+  listw = lw_h1,
+  zero.policy = TRUE
+)
+
+moran_sar_bivar <- spdep::moran.test(
+  as.numeric(residuals(sar_h1_bivar)),
+  listw = lw_h1,
+  zero.policy = TRUE
+)
+
+N_sar_bivar <- if (!is.null(sar_h1_bivar$N)) sar_h1_bivar$N else length(residuals(sar_h1_bivar))
+
+diag_tbl_bivar <- tibble::tibble(
+  Metric = c("N", "AIC", "Adj. R^2 (OLS only)", "rho (SAR only)", "Residual Moran's I", "Residual Moran's I p"),
+  OLS = c(
+    nobs(ols_bivar),
+    AIC(ols_bivar),
+    summary(ols_bivar)$adj.r.squared,
+    NA_real_,
+    unname(moran_ols_bivar$estimate[["Moran I statistic"]]),
+    moran_ols_bivar$p.value
+  ),
+  SAR = c(
+    N_sar_bivar,
+    AIC(sar_h1_bivar),
+    NA_real_,
+    sar_h1_bivar$rho,
+    unname(moran_sar_bivar$estimate[["Moran I statistic"]]),
+    moran_sar_bivar$p.value
+  )
+)
+
+knitr::kable(diag_tbl_bivar, digits = 4, caption = "Diagnostics (Bivariate)")
+
+```
+
+
+#### 1.2 Full model with controls
+
+**H1. Full model with controls (OLS vs SAR)**
+In the controlled OLS model, the layoff coefficient becomes small and statistically insignificant (**−0.384**, p = 0.605), indicating that the bivariate association does not survive once county socioeconomic and political controls are included. However, even with these controls, the OLS residuals remain **strongly spatially autocorrelated** (residual Moran’s I = **0.201**, p < 2.2e−16), implying that OLS is still leaving substantial spatial dependence unmodeled.
+
+The SAR specification again reveals strong spatial spillovers (**ρ = 0.268**, p < 2.2e−16) and improves model fit (**AIC 3116.3 → 3016.2**). The layoff coefficient remains insignificant in SAR as well (**−0.240**, p = 0.735), consistent with the conclusion that layoffs do not have an independent association with excess commenting conditional on controls. Importantly, the SAR model effectively resolves residual spatial dependence: residual Moran’s I is near zero (**0.00265**, p = 0.434), and your LM residual autocorrelation test is also not significant (p = 0.756).
+
+```{r}
+#| label: tab-h1-full
+#| message: false
+#| warning: false
+
+# --- coefficient table ---
+
+coef_long_full <- bind_rows(
+tidy_lm(ols_full, "OLS"),
+tidy_sar(sar_full, "SAR")
+) %>%
+mutate(cell = fmt_cell(estimate, std.error, p.value)) %>%
+select(model, term, cell)
+
+coef_wide_full <- coef_long_full %>%
+pivot_wider(names_from = model, values_from = cell)
+
+
+order_terms <- c(
+"Intercept",
+"ln_steel_vc_layoff_rate",
+"ln_emp_total",
+"ln_pcap_inc",
+"ln_pop",
+"ln_emp_manu",
+"unemployment_rate",
+"voteshare_dg"
+)
+
+coef_wide_full <- coef_wide_full %>%
+mutate(.ord = match(term, order_terms)) %>%
+arrange(.ord, term) %>%
+select(-.ord)
+
+kable(coef_wide_full, align = "lcc", caption = "H1 Full Regression: OLS vs SAR (cells are Estimate with SE in parentheses; stars by p-value)")
+
+# --- model diagnostics table ---
+moran_ols_full <- spdep::moran.test(
+  as.numeric(residuals(ols_full)),
+  listw = lw_h1,
+  zero.policy = TRUE
+)
+
+moran_sar_full <- spdep::moran.test(
+  as.numeric(residuals(sar_full)),
+  listw = lw_h1,
+  zero.policy = TRUE
+)
+
+N_sar_full <- if (!is.null(sar_full$N)) sar_full$N else length(residuals(sar_full))
+
+diag_tbl_full <- tibble::tibble(
+  Metric = c("N", "AIC", "Adj. R^2 (OLS only)", "rho (SAR only)", "Residual Moran's I", "Residual Moran's I p"),
+  OLS = c(
+    nobs(ols_full),
+    AIC(ols_full),
+    summary(ols_full)$adj.r.squared,
+    NA_real_,
+    unname(moran_ols_full$estimate[["Moran I statistic"]]),
+    moran_ols_full$p.value
+  ),
+  SAR = c(
+    N_sar_full,
+    AIC(sar_full),
+    NA_real_,
+    sar_full$rho,
+    unname(moran_sar_full$estimate[["Moran I statistic"]]),
+    moran_sar_full$p.value
+  )
+)
+
+knitr::kable(diag_tbl_full, digits = 4, caption = "Diagnostics (Full model)")
+
+```
+
+
+#### 1.3 Interpretation for H1
+
+Overall, the evidence suggests that excess commenting is fundamentally spatially clustered: SAR greatly improves fit and removes residual spatial autocorrelation, while the layoff–comment association is visible only in the bivariate model and disappears after conditioning on standard county controls.
+
+
+
+### 2. IRA comments and steel footprint
+
+This section asks whether county-level excess commenting on IRA dockets (measured by `log_comm_rr`) is systematically related to a place-based steel footprint. I operationalize steel footprint in three complementary ways: (i) whether a county hosts at least one steel plant and how many plants it hosts, (ii) distance to the nearest steel plant, and (iii) membership in a contiguity-expanded “steel corridor” intended to capture multi-county heavy-industry regions. I start with OLS and then move to a spatial-lag (SAR) specification when residual spatial autocorrelation suggests that counties cannot be treated as independent units.
+
+```{r}
+#| label: h2-samples
+#| include: false
+
+reg_sp3 <- panel_sp3 %>%
+  filter(
+    !st_is_empty(geometry),
+    !is.na(log_comm_rr),
+    !is.na(emp_total),
+    !is.na(pcap_income),
+    !is.na(unemployment_rate),
+    !is.na(has_plant),
+    !is.na(n_plants_cty),
+    !is.na(dist_to_steel_km),
+    !is.na(steel_corridor_nb)
+  )
+
+nb_sp3 <- poly2nb(reg_sp3, queen = TRUE)
+lw_sp3 <- nb2listw(nb_sp3, style = "W", zero.policy = TRUE)
+```
+
+```{r}
+#| label: h2-ols-plant
+#| message: false
+#| warning: false
+
+ols_comm_plant <- lm(
+  log_comm_rr ~ has_plant + n_plants_cty +
+    log(emp_total + 1) + pcap_income + unemployment_rate,
+  data = reg_sp3 %>% st_drop_geometry()
+)
+# summary(ols_comm_plant)
+```
+
+```{r}
+#| label: h2-ols-distance
+#| message: false
+#| warning: false
+
+ols_dist <- lm(
+  log_comm_rr ~ dist_to_steel_km +
+    log(emp_total + 1) + pcap_income + unemployment_rate,
+  data = reg_sp3 %>% st_drop_geometry()
+)
+# summary(ols_dist)
+```
+
+```{r}
+#| label: h2-ols-corridor
+#| message: false
+#| warning: false
+
+ols_corridor <- lm(
+  log_comm_rr ~ steel_corridor_nb +
+    log(emp_total + 1) + pcap_income + unemployment_rate,
+  data = reg_sp3 %>% st_drop_geometry(),
+  na.action = na.fail
+)
+# summary(ols_corridor)
+
+moran_ols_corridor <- moran.test(
+  as.numeric(residuals(ols_corridor)),
+  lw_sp3,
+  zero.policy = TRUE
+)
+# moran_ols_corridor
+
+```
+
+
+```{r}
+#| label: h2-sar-corridor
+#| message: false
+#| warning: false
+
+sar_corridor_nb <- lagsarlm(
+  log_comm_rr ~ steel_corridor_nb +
+    scale(log(emp_total + 1)) +
+    scale(pcap_income) +
+    scale(unemployment_rate),
+  data        = reg_sp3,
+  listw       = lw_sp3,
+  method      = "eigen",
+  zero.policy = TRUE
+)
+# summary(sar_corridor_nb)
+
+moran_sar_corridor <- moran.test(as.numeric(residuals(sar_corridor_nb)), lw_sp3, zero.policy = TRUE)
+# moran_sar_corridor
+
+```
+
+
+
+#### 2.1 Plant presence and plant counts
+
+In the plant-based OLS specification, neither hosting a plant nor the number of plants is meaningfully associated with excess commenting. The plant-host indicator is close to zero and imprecisely estimated (β = −0.039, p = 0.851), and plant counts are likewise statistically indistinguishable from zero (β = 0.073, p = 0.633). In other words, point-location measures of steel presence do not appear to explain cross-county variation in `log_comm_rr` once baseline covariates are included.
+
+```{r}
+#| label: tab-footprint-plants-ols
+#| message: false
+#| warning: false
+
+# --- coefficient table ---
+
+coef_long_plants_ols <- bind_rows(
+tidy_lm(ols_comm_plant, "OLS")
+) %>%
+mutate(cell = fmt_cell(estimate, std.error, p.value)) %>%
+select(model, term, cell)
+
+coef_wide_plants_ols <- coef_long_plants_ols %>%
+pivot_wider(names_from = model, values_from = cell)
+
+order_terms <- c(
+  "Intercept",
+  "has_plantTRUE",
+  "n_plants_cty",
+  "log(emp_total + 1)",
+  "pcap_income",
+  "unemployment_rate"
+)
+
+coef_wide_plants_ols <- coef_wide_plants_ols %>%
+mutate(.ord = match(term, order_terms)) %>%
+arrange(.ord, term) %>%
+select(-.ord)
+
+kable(
+coef_wide_plants_ols,
+align   = "lc",
+caption = "Footprint (Plants): OLS coefficients (cells are Estimate with SE in parentheses; stars by p-value)"
+)
+
+# --- model diagnostics table ---
+
+diag_tbl_plants_ols <- tibble::tibble(
+Metric = c("N", "R²", "Adj. R²", "RMSE", "AIC"),
+OLS = c(
+nobs(ols_comm_plant),
+summary(ols_comm_plant)$r.squared,
+summary(ols_comm_plant)$adj.r.squared,
+sqrt(mean(residuals(ols_comm_plant)^2, na.rm = TRUE)),
+AIC(ols_comm_plant)
+)
+)
+
+knitr::kable(diag_tbl_plants_ols, digits = 4, caption = "Diagnostics (Plants: OLS)")
+
+```
+
+#### 2.2 Distance to the nearest steel plant
+
+Replacing plant indicators with continuous proximity yields a small but statistically significant relationship: distance to steel is **positive** (β = 2.885e−4, p = 0.0078). Substantively, the effect is modest, but the direction implies that—conditional on the same baseline covariates—counties **farther** from steel plants exhibit slightly higher excess commenting intensity. This pattern is inconsistent with a simple “closer to steel → more commenting” mechanism and suggests that distance is capturing something broader than immediate plant adjacency.
+
+```{r}
+#| label: tab-footprint-distance-ols
+#| message: false
+#| warning: false
+
+# --- coefficient table ---
+
+coef_long_dist_ols <- bind_rows(
+tidy_lm(ols_dist, "OLS")
+) %>%
+mutate(cell = fmt_cell(estimate, std.error, p.value)) %>%
+select(model, term, cell)
+
+coef_wide_dist_ols <- coef_long_dist_ols %>%
+pivot_wider(names_from = model, values_from = cell)
+
+order_terms <- c(
+  "Intercept",
+  "dist_to_steel_km",
+  "log(emp_total + 1)",
+  "pcap_income",
+  "unemployment_rate"
+)
+
+coef_wide_dist_ols <- coef_wide_dist_ols %>%
+mutate(.ord = match(term, order_terms)) %>%
+arrange(.ord, term) %>%
+select(-.ord)
+
+kable(
+coef_wide_dist_ols,
+align   = "lc",
+caption = "Footprint (Distance): OLS coefficients (cells are Estimate with SE in parentheses; stars by p-value)"
+)
+
+# --- model diagnostics table ---
+
+diag_tbl_dist_ols <- tibble::tibble(
+Metric = c("N", "R²", "Adj. R²", "RMSE", "AIC"),
+OLS = c(
+nobs(ols_dist),
+summary(ols_dist)$r.squared,
+summary(ols_dist)$adj.r.squared,
+sqrt(mean(residuals(ols_dist)^2, na.rm = TRUE)),
+AIC(ols_dist)
+)
+)
+
+knitr::kable(diag_tbl_dist_ols, digits = 4, caption = "Diagnostics (Distance: OLS)")
+```
+
+#### 2.3 Steel corridor membership and spatial diagnostics
+
+When steel exposure is defined at the regional scale via corridor membership, the association becomes clearer: corridor counties have higher excess commenting in OLS (β = 0.104, p = 0.011). However, this OLS specification still leaves substantial spatial dependence in the residuals (residual Moran’s I ≈ 0.202, p < 2.2e−16), indicating that the apparent corridor effect is estimated in the presence of strong geographic clustering that violates the independence assumption underlying OLS inference. This motivates a spatial specification that explicitly models spillovers across neighboring counties.
+
+```{r}
+#| label: tab-footprint-corridor-ols
+#| message: false
+#| warning: false
+
+# --- coefficient table ---
+
+coef_long_corridor_ols <- bind_rows(
+tidy_lm(ols_corridor, "OLS")
+) %>%
+mutate(cell = fmt_cell(estimate, std.error, p.value)) %>%
+select(model, term, cell)
+
+coef_wide_corridor_ols <- coef_long_corridor_ols %>%
+pivot_wider(names_from = model, values_from = cell)
+
+order_terms <- c(
+  "Intercept",
+  "steel_corridor_nbTRUE",
+  "log(emp_total + 1)",
+  "pcap_income",
+  "unemployment_rate"
+)
+
+
+coef_wide_corridor_ols <- coef_wide_corridor_ols %>%
+mutate(.ord = match(term, order_terms)) %>%
+arrange(.ord, term) %>%
+select(-.ord)
+
+kable(
+coef_wide_corridor_ols,
+align   = "lc",
+caption = "Footprint (Corridor): OLS coefficients (cells are Estimate with SE in parentheses; stars by p-value)"
+)
+
+# --- model diagnostics table (includes residual Moran's I) ---
+
+moran_corridor_ols <- spdep::moran.test(
+as.numeric(residuals(ols_corridor)),
+listw = lw_sp3,
+zero.policy = TRUE
+)
+
+diag_tbl_corridor_ols <- tibble::tibble(
+Metric = c("N", "AIC", "Adj. R^2 (OLS only)", "Residual Moran's I", "Residual Moran's I p"),
+OLS = c(
+nobs(ols_corridor),
+AIC(ols_corridor),
+summary(ols_corridor)$adj.r.squared,
+unname(moran_corridor_ols$estimate[["Moran I statistic"]]),
+moran_corridor_ols$p.value
+)
+)
+
+knitr::kable(diag_tbl_corridor_ols, digits = 4, caption = "Diagnostics (Corridor: OLS)")
+
+```
+
+#### 2.4 Corridor SAR model
+
+I therefore estimate a spatial-lag (SAR) model using the same queen-contiguity weights. The SAR results confirm strong spatial spillovers (ρ = 0.299, p < 2.2e−16) and retain a corridor association of similar magnitude (β = 0.099, p = 0.011). Model fit improves substantially relative to the OLS benchmark (AIC 3189.7 → 3064.2), and residual spatial autocorrelation is effectively removed (residual Moran’s I not significant). Taken together, these results indicate that the corridor indicator captures a robust place-based association with excess commenting, but credible inference requires modeling spatial dependence explicitly rather than relying on OLS.
+
+```{r}
+#| label: tab-footprint-corridor-sar
+#| message: false
+#| warning: false
+
+# --- coefficient table ---
+
+coef_long_corridor_sar <- bind_rows(
+tidy_sar(sar_corridor_nb, "SAR")
+) %>%
+mutate(cell = fmt_cell(estimate, std.error, p.value)) %>%
+select(model, term, cell)
+
+coef_wide_corridor_sar <- coef_long_corridor_sar %>%
+pivot_wider(names_from = model, values_from = cell)
+
+order_terms <- c(
+  "Intercept",
+  "steel_corridor_nbTRUE",
+  "scale(log(emp_total + 1))",
+  "scale(pcap_income)",
+  "scale(unemployment_rate)"
+)
+
+
+coef_wide_corridor_sar <- coef_wide_corridor_sar %>%
+mutate(.ord = match(term, order_terms)) %>%
+arrange(.ord, term) %>%
+select(-.ord)
+
+kable(
+coef_wide_corridor_sar,
+align   = "lc",
+caption = "Footprint (Corridor): SAR coefficients (cells are Estimate with SE in parentheses; stars by p-value)"
+)
+
+# --- model diagnostics table (includes residual Moran's I) ---
+
+moran_corridor_sar <- spdep::moran.test(
+as.numeric(residuals(sar_corridor_nb)),
+listw = lw_sp3,
+zero.policy = TRUE
+)
+
+N_sar_corridor <- if (!is.null(sar_corridor_nb$N)) sar_corridor_nb$N else length(residuals(sar_corridor_nb))
+
+diag_tbl_corridor_sar <- tibble::tibble(
+Metric = c("N", "AIC", "LogLik", "rho (SAR only)", "Residual Moran's I", "Residual Moran's I p"),
+SAR = c(
+N_sar_corridor,
+AIC(sar_corridor_nb),
+as.numeric(logLik(sar_corridor_nb)),
+sar_corridor_nb$rho,
+unname(moran_corridor_sar$estimate[["Moran I statistic"]]),
+moran_corridor_sar$p.value
+)
+)
+
+knitr::kable(diag_tbl_corridor_sar, digits = 4, caption = "Diagnostics (Corridor: SAR)")
+
+```
+
+
+
+### 3. Industrial belt falsification (SAR)
+
+This section provides a falsification-style test. If excess commenting is mainly driven by **broad manufacturing-region clustering**, rather than steel-specific exposure, then a county-level **industrial belt** indicator—defined as counties in **LISA High–High (HH)** clusters of manufacturing employment share (p < 0.05)—should predict `log_comm_rr` in a spatial model.
+
+I estimate a **spatial-lag (SAR)** model on the aligned sample (**N = 1607**) using the same **queen-contiguity** weights matrix (`lw_indbelt`). The model includes `industrial_belt` and standardized controls (`scale(log(emp_total+1))`, `scale(pcap_income)`, `scale(unemployment_rate)`).
+
+**Results.** The industrial-belt indicator is **not statistically significant** after accounting for spatial dependence and controls (`industrial_beltTRUE` = −0.068, SE = 0.052, p = 0.189). In contrast, the standardized controls remain strongly associated with `log_comm_rr`: higher total employment is associated with lower excess commenting (−0.304, p < 2.2e−16), while higher per-capita income (0.210, p < 2.2e−16) and higher unemployment (0.082, p = 3.34e−07) are associated with higher excess commenting.
+
+Spatial dependence is substantial and highly significant (**rho = 0.298**, LR test p < 2.2e−16), confirming strong spillovers in the outcome. Model fit improves relative to the corresponding OLS benchmark (**AIC 3223.1 → 3099.9**).
+
+Finally, **residual spatial autocorrelation is effectively removed**: residual Moran’s I is small and not significant (I = −0.0185, p = 0.815), indicating the SAR specification absorbs the main spatial clustering left in OLS residuals.
+
+Overall, this falsification-style result suggests that a generic **manufacturing-belt** label does not independently explain excess commenting once spatial spillovers and baseline economic conditions are modeled, which supports interpreting the earlier footprint results (e.g., steel corridor) as more informative than broad manufacturing clustering alone.
+
+```{r}
+#| label: h2-sar-industrial-belt
+#| message: false
+#| warning: false
+
+reg_indbelt <- panel_sp3 %>%
+  filter(
+    !st_is_empty(geometry),
+    !is.na(log_comm_rr),
+    !is.na(emp_total),
+    !is.na(pcap_income),
+    !is.na(unemployment_rate),
+    !is.na(industrial_belt)
+  )
+
+nb_indbelt <- poly2nb(reg_indbelt, queen = TRUE)
+lw_indbelt <- nb2listw(nb_indbelt, style = "W", zero.policy = TRUE)
+
+sar_indbelt <- lagsarlm(
+  log_comm_rr ~ industrial_belt +
+    scale(log(emp_total + 1)) +
+    scale(pcap_income) +
+    scale(unemployment_rate),
+  data        = reg_indbelt,
+  listw       = lw_indbelt,
+  method      = "eigen",
+  zero.policy = TRUE
+)
+# summary(sar_indbelt)
+
+moran_sar_indbelt <- moran.test(as.numeric(residuals(sar_indbelt)), lw_indbelt, zero.policy = TRUE)
+# moran_sar_indbelt
+
+```
+
+```{r}
+#| label: tab-indbelt-coefs
+#| tbl-cap: "Industrial belt falsification: OLS vs SAR (dependent variable: log_comm_rr)"
+#| echo: false
+#| message: false
+#| warning: false
+
+# ---- (0) ensure OLS object exists (match SAR formula exactly) ----
+
+if (!exists("ols_indbelt")) {
+ols_indbelt <- lm(
+log_comm_rr ~ industrial_belt +
+scale(log(emp_total + 1)) +
+scale(pcap_income) +
+scale(unemployment_rate),
+data = reg_indbelt %>% st_drop_geometry(),
+na.action = na.fail
+)
+}
+
+# ---- (1) tidy helpers ----
+
+tidy_lm <- function(m) {
+broom::tidy(m) %>%
+transmute(
+term = if_else(term == "(Intercept)", "Intercept", term),
+estimate = estimate,
+std.error = std.error,
+statistic = statistic,
+p.value = p.value
+)
+}
+
+tidy_sar <- function(m) {
+co <- as.data.frame(summary(m)$Coef)
+co$term <- rownames(co); rownames(co) <- NULL
+tibble::as_tibble(co) %>%
+dplyr::rename(
+estimate  = Estimate,
+std.error = `Std. Error`,
+statistic = `z value`,
+p.value   = `Pr(>|z|)`
+) %>%
+dplyr::mutate(term = if_else(term == "(Intercept)", "Intercept", term)) %>%
+dplyr::select(term, estimate, std.error, statistic, p.value)
+}
+
+fmt_cell <- function(est, se, p) {
+stars <- dplyr::case_when(
+is.na(p) ~ "",
+p < 0.001 ~ "***",
+p < 0.01  ~ "**",
+p < 0.05  ~ "*",
+p < 0.1   ~ ".",
+TRUE ~ ""
+)
+paste0(sprintf("%.3f", est), stars, " (", sprintf("%.3f", se), ")")
+}
+
+# ---- (2) build wide coefficient table ----
+
+ols_t <- tidy_lm(ols_indbelt) %>%
+dplyr::mutate(model = "OLS", cell = fmt_cell(estimate, std.error, p.value)) %>%
+dplyr::select(model, term, cell)
+
+sar_t <- tidy_sar(sar_indbelt) %>%
+dplyr::mutate(model = "SAR", cell = fmt_cell(estimate, std.error, p.value)) %>%
+dplyr::select(model, term, cell)
+
+coef_wide <- dplyr::bind_rows(ols_t, sar_t) %>%
+tidyr::pivot_wider(names_from = model, values_from = cell) %>%
+dplyr::mutate(
+.ord = dplyr::case_when(
+term == "Intercept" ~ 1,
+term == "industrial_beltTRUE" ~ 2,
+term == "scale(log(emp_total + 1))" ~ 3,
+term == "scale(pcap_income)" ~ 4,
+term == "scale(unemployment_rate)" ~ 5,
+TRUE ~ 99
+)
+) %>%
+dplyr::arrange(.ord, term) %>%
+dplyr::select(-.ord)
+
+knitr::kable(
+coef_wide,
+align = "lcc",
+caption = "Coefficients reported as Estimate (SE). Significance: *** p<0.001, ** p<0.01, * p<0.05, . p<0.1"
+)
+```
+
+```{r}
+#| label: tab-indbelt-diagnostics
+#| tbl-cap: "Industrial belt falsification: model diagnostics"
+#| echo: false
+#| message: false
+#| warning: false
+
+# residual Moran's I for SAR
+
+moran_sar_ind <- spdep::moran.test(
+as.numeric(residuals(sar_indbelt)),
+lw_indbelt,
+zero.policy = TRUE
+)
+
+# residual Moran's I for OLS (optional but useful)
+
+moran_ols_ind <- spdep::moran.test(
+as.numeric(residuals(ols_indbelt)),
+lw_indbelt,
+zero.policy = TRUE
+)
+
+diag_tbl <- tibble::tibble(
+Metric = c(
+"N",
+"AIC",
+"Adj. R^2 (OLS only)",
+"rho (SAR only)",
+"LogLik (SAR)",
+"Sigma (SAR)",
+"Residual Moran's I (OLS)",
+"Residual Moran's I p (OLS)",
+"Residual Moran's I (SAR)",
+"Residual Moran's I p (SAR)"
+),
+OLS = c(
+nobs(ols_indbelt),
+AIC(ols_indbelt),
+summary(ols_indbelt)$adj.r.squared,
+NA_real_,
+NA_real_,
+NA_real_,
+unname(moran_ols_ind$estimate[["Moran I statistic"]]),
+moran_ols_ind$p.value,
+NA_real_,
+NA_real_
+),
+SAR = c(
+if (!is.null(sar_indbelt$N)) sar_indbelt$N else length(residuals(sar_indbelt)),
+AIC(sar_indbelt),
+NA_real_,
+sar_indbelt$rho,
+as.numeric(logLik(sar_indbelt)),
+sqrt(sar_indbelt$s2),
+NA_real_,
+NA_real_,
+unname(moran_sar_ind$estimate[["Moran I statistic"]]),
+moran_sar_ind$p.value
+)
+)
+
+knitr::kable(diag_tbl, digits = 4)
+```
+
+
+### 4. Apprenticeships ~ steel exposure + layoffs (OLS + SAR)
+
+```{r}
+#| label: appr-ols-sar
+#| message: false
+#| warning: false
+
+reg_appr <- panel_sp3_appr %>%
+  filter(
+    !st_is_empty(geometry),
+    !is.na(ln_appr_all),
+    !is.na(n_plants_cty),
+    !is.na(dist_to_steel_km),
+    !is.na(steel_corridor_nb),
+    !is.na(ln_steel_vc_layoff_rate),
+    !is.na(emp_total),
+    !is.na(population),
+    !is.na(pcap_income),
+    !is.na(emp_manu),
+    !is.na(unemployment_rate)
+  ) %>%
+  mutate(
+    ln_emp_total = log(emp_total + 1),
+    ln_pop       = log(population + 1),
+    ln_pcap_inc  = log(pcap_income + 1),
+    ln_emp_manu  = log(emp_manu + 1)
+  )
+
+nb_appr_reg <- poly2nb(reg_appr, queen = TRUE)
+lw_appr_reg <- nb2listw(nb_appr_reg, style = "W", zero.policy = TRUE)
+
+ols_appr <- lm(
+  ln_appr_all ~
+    steel_corridor_nb +
+    n_plants_cty +
+    dist_to_steel_km +
+    ln_steel_vc_layoff_rate +
+    ln_emp_total +
+    ln_pcap_inc +
+    ln_pop +
+    ln_emp_manu +
+    unemployment_rate,
+  data = reg_appr
+)
+# summary(ols_appr)
+
+moran_ols_appr <- moran.test(as.numeric(residuals(ols_appr)), lw_appr_reg, zero.policy = TRUE)
+# moran_ols_appr
+
+sar_appr <- lagsarlm(
+  ln_appr_all ~
+    steel_corridor_nb +
+    n_plants_cty +
+    dist_to_steel_km +
+    ln_steel_vc_layoff_rate +
+    ln_emp_total +
+    ln_pcap_inc +
+    ln_pop +
+    ln_emp_manu +
+    unemployment_rate,
+  data        = reg_appr,
+  listw       = lw_appr_reg,
+  method      = "eigen",
+  zero.policy = TRUE
+)
+# summary(sar_appr)
+
+moran_sar_appr <- moran.test(as.numeric(residuals(sar_appr)), lw_appr_reg, zero.policy = TRUE)
+# moran_sar_appr
+```
+
+This section tests whether county apprenticeship intensity (`ln_appr_all`) is associated with steel footprint measures (corridor membership, plant count, distance to the nearest plant) and lagged steel value-chain layoff exposure (`ln_steel_vc_layoff_rate`), controlling for county scale and local economic conditions. Because apprenticeship intensity is highly spatially clustered, I estimate both OLS and a spatial-lag (SAR) model using queen contiguity weights, and I report residual spatial diagnostics.
+
+Key takeaway: the SAR model indicates **very strong spatial dependence** in apprenticeship intensity (`rho ≈ 0.519`), substantially improves model fit (AIC drops sharply), but **does not eliminate residual spatial autocorrelation**, suggesting additional spatial processes beyond a simple spatial-lag structure.
+
+```{r}
+#| label: tab-appr-coefs
+#| tbl-cap: "Apprenticeships vs steel exposure and layoffs: OLS vs SAR (DV = ln_appr_all)"
+#| echo: false
+#| message: false
+#| warning: false
+
+# ---- safety: create OLS if missing ----
+
+if (!exists("ols_appr")) {
+ols_appr <- lm(
+ln_appr_all ~ steel_corridor_nb + n_plants_cty + dist_to_steel_km +
+ln_steel_vc_layoff_rate + ln_emp_total + ln_pcap_inc + ln_pop +
+ln_emp_manu + unemployment_rate,
+data = reg_appr,
+na.action = na.fail
+)
+}
+
+# ---- tidy helpers ----
+
+tidy_lm <- function(m) {
+broom::tidy(m) %>%
+transmute(
+term = if_else(term == "(Intercept)", "Intercept", term),
+estimate = estimate,
+std.error = std.error,
+statistic = statistic,
+p.value = p.value
+)
+}
+
+tidy_sar <- function(m) {
+co <- as.data.frame(summary(m)$Coef)
+co$term <- rownames(co); rownames(co) <- NULL
+tibble::as_tibble(co) %>%
+dplyr::rename(
+estimate  = Estimate,
+std.error = `Std. Error`,
+statistic = `z value`,
+p.value   = `Pr(>|z|)`
+) %>%
+dplyr::mutate(term = if_else(term == "(Intercept)", "Intercept", term)) %>%
+dplyr::select(term, estimate, std.error, statistic, p.value)
+}
+
+fmt_cell <- function(est, se, p) {
+stars <- dplyr::case_when(
+is.na(p) ~ "",
+p < 0.001 ~ "***",
+p < 0.01  ~ "**",
+p < 0.05  ~ "*",
+p < 0.1   ~ ".",
+TRUE ~ ""
+)
+paste0(sprintf("%.3f", est), stars, " (", sprintf("%.3f", se), ")")
+}
+
+# ---- build wide coefficient table ----
+
+ols_t <- tidy_lm(ols_appr) %>%
+dplyr::mutate(model = "OLS", cell = fmt_cell(estimate, std.error, p.value)) %>%
+dplyr::select(model, term, cell)
+
+sar_t <- tidy_sar(sar_appr) %>%
+dplyr::mutate(model = "SAR", cell = fmt_cell(estimate, std.error, p.value)) %>%
+dplyr::select(model, term, cell)
+
+order_terms <- c(
+"Intercept",
+"steel_corridor_nbTRUE",
+"n_plants_cty",
+"dist_to_steel_km",
+"ln_steel_vc_layoff_rate",
+"ln_emp_total",
+"ln_pcap_inc",
+"ln_pop",
+"ln_emp_manu",
+"unemployment_rate"
+)
+
+coef_wide <- dplyr::bind_rows(ols_t, sar_t) %>%
+tidyr::pivot_wider(names_from = model, values_from = cell) %>%
+dplyr::mutate(.ord = match(term, order_terms)) %>%
+dplyr::arrange(.ord, term) %>%
+dplyr::select(-.ord)
+
+knitr::kable(
+coef_wide,
+align = "lcc",
+caption = "Cells are Estimate (SE). Significance: *** p<0.001, ** p<0.01, * p<0.05, . p<0.1"
+)
+```
+
+```{r}
+#| label: tab-appr-diagnostics
+#| tbl-cap: "Apprenticeships model diagnostics"
+#| echo: false
+#| message: false
+#| warning: false
+
+moran_ols_appr <- spdep::moran.test(
+as.numeric(residuals(ols_appr)),
+lw_appr_reg,
+zero.policy = TRUE
+)
+
+moran_sar_appr <- spdep::moran.test(
+as.numeric(residuals(sar_appr)),
+lw_appr_reg,
+zero.policy = TRUE
+)
+
+diag_tbl <- tibble::tibble(
+Metric = c(
+"N",
+"AIC",
+"R^2 (OLS only)",
+"Adj. R^2 (OLS only)",
+"rho (SAR)",
+"LogLik (SAR)",
+"Sigma (SAR)",
+"Residual Moran's I (OLS)",
+"Residual Moran's I p (OLS)",
+"Residual Moran's I (SAR)",
+"Residual Moran's I p (SAR)"
+),
+OLS = c(
+nobs(ols_appr),
+AIC(ols_appr),
+summary(ols_appr)$r.squared,
+summary(ols_appr)$adj.r.squared,
+NA_real_,
+NA_real_,
+NA_real_,
+unname(moran_ols_appr$estimate[["Moran I statistic"]]),
+moran_ols_appr$p.value,
+NA_real_,
+NA_real_
+),
+SAR = c(
+if (!is.null(sar_appr$N)) sar_appr$N else length(residuals(sar_appr)),
+AIC(sar_appr),
+NA_real_,
+NA_real_,
+sar_appr$rho,
+as.numeric(logLik(sar_appr)),
+sqrt(sar_appr$s2),
+NA_real_,
+NA_real_,
+unname(moran_sar_appr$estimate[["Moran I statistic"]]),
+moran_sar_appr$p.value
+)
+)
+
+knitr::kable(diag_tbl, digits = 4)
+```
+
+
+### 5. Layoffs × Apprenticeships typology (2×2) + map + tests
+
+This section combines steel value-chain layoff exposure and apprenticeship intensity into a simple 2×2 county typology, using a median split on `ln(LayoffRate + 1)` and `ln(ApprAll)`. The goal is descriptive: to test whether counties with “high layoffs” and/or “high registered apprenticeships (RA)” exhibit systematically different IRA commenting intensity (`log_comm_rr`), and whether any differences persist after accounting for spatial dependence.
+
+
+```{r}
+#| label: appr-layoff-typology
+#| message: false
+#| warning: false
+
+panel_typo <- panel_sp3 %>%
+  filter(!is.na(ln_steel_vc_layoff_rate), !is.na(ln_appr_all)) %>%
+  mutate(
+    med_layoff = median(ln_steel_vc_layoff_rate, na.rm = TRUE),
+    med_appr   = median(ln_appr_all, na.rm = TRUE),
+
+    high_layoff = ln_steel_vc_layoff_rate >= med_layoff,
+    high_appr   = ln_appr_all >= med_appr,
+
+    appr_layoff_type = case_when(
+      high_layoff & high_appr  ~ "High layoff & High RA",
+      high_layoff & !high_appr ~ "High layoff & Low RA",
+      !high_layoff & high_appr ~ "Low layoff & High RA",
+      TRUE                     ~ "Low layoff & Low RA"
+    ),
+    appr_layoff_type = factor(
+      appr_layoff_type,
+      levels = c(
+        "High layoff & High RA",
+        "High layoff & Low RA",
+        "Low layoff & High RA",
+        "Low layoff & Low RA"
+      )
+    )
+  )
+
+# table(panel_typo$appr_layoff_type)
+```
+
+```{r}
+#| label: map-typology
+#| warning: false
+#| message: false
+
+mapview(panel_typo %>% st_transform(4326),
+        zcol = "appr_layoff_type",
+        layer.name = "Layoffs × RA (median split)",
+        legend = TRUE,
+        na.color = "transparent",
+        color = "#7c7c7cff", lwd = 1.0, alpha = 0.4
+        ) +
+  mapview(
+    st_transform(states_sf, 4326),
+    layer.name = "State boundaries",
+    col.regions = "transparent", alpha.regions = 0,
+    color = "#1b1b1bff", lwd = 0.8,
+    legend = FALSE
+  )
+
+```
+
+```{r}
+#| label: summarize-typology-comments
+#| message: false
+#| warning: false
+
+panel_typo %>%
+  st_drop_geometry() %>%
+  group_by(appr_layoff_type) %>%
+  summarise(
+    n              = n(),
+    mean_log_rr    = mean(log_comm_rr,   na.rm = TRUE),
+    mean_log_rate  = mean(log_comm_rate, na.rm = TRUE),
+    mean_comm      = mean(comm_total,    na.rm = TRUE),
+    mean_noise     = mean(noise_share,   na.rm = TRUE)
+  )
+
+anova_rr <- aov(log_comm_rr ~ appr_layoff_type, data = panel_typo %>% st_drop_geometry())
+# summary(anova_rr)
+```
+
+
+```{r}
+#| label: typo-ols-sar-comments
+#| message: false
+#| warning: false
+
+reg_typo <- panel_typo %>%
+  filter(
+    !st_is_empty(geometry),
+    !is.na(log_comm_rr),
+    !is.na(emp_total),
+    !is.na(population),
+    !is.na(pcap_income),
+    !is.na(emp_manu),
+    !is.na(unemployment_rate),
+    !is.na(voteshare_dg)
+  ) %>%
+  mutate(
+    ln_emp_total = log(emp_total + 1),
+    ln_pop       = log(population + 1),
+    ln_pcap_inc  = log(pcap_income + 1),
+    ln_emp_manu  = log(emp_manu + 1),
+    appr_layoff_type = relevel(appr_layoff_type, ref = "Low layoff & Low RA")
+  )
+
+ols_typo <- lm(
+  log_comm_rr ~ appr_layoff_type +
+    ln_emp_total + ln_pcap_inc + ln_pop +
+    ln_emp_manu + unemployment_rate + voteshare_dg,
+  data = reg_typo
+)
+# summary(ols_typo)
+
+nb_typo <- poly2nb(reg_typo, queen = TRUE)
+lw_typo <- nb2listw(nb_typo, style = "W", zero.policy = TRUE)
+
+sar_typo <- lagsarlm(
+  log_comm_rr ~ appr_layoff_type +
+    ln_emp_total + ln_pcap_inc + ln_pop +
+    ln_emp_manu + unemployment_rate + voteshare_dg,
+  data        = reg_typo,
+  listw       = lw_typo,
+  method      = "eigen",
+  zero.policy = TRUE
+)
+# summary(sar_typo)
+
+moran_sar_typo <- moran.test(as.numeric(residuals(sar_typo)), lw_typo, zero.policy = TRUE)
+# moran_sar_typo
+```
+
+
+#### 5.1 Constructing the 2×2 typology (median split)
+
+Counties are classified into four mutually exclusive groups based on whether `ln(LayoffRate + 1)` and `ln(ApprAll)` are above (≥) their sample medians. In the analysis sample, group sizes are:
+
+* High layoff & High RA: **686**
+* High layoff & Low RA: **795**
+* Low layoff & High RA: **800**
+* Low layoff & Low RA: **680**
+
+#### 5.2 Descriptive group differences in commenting outcomes
+
+Table 5 reports group means for the main outcome `log_comm_rr` and additional descriptive measures (`log_comm_rate`, `comm_total`, `noise_share`). Mean `log_comm_rr` differs sharply across the four cells (e.g., High layoff & Low RA and Low layoff & Low RA are positive on average, while the two High-RA cells are negative on average).
+
+A one-way ANOVA rejects equal means across the four groups: **F(3, 1586) = 45.2, p < 2e-16**. (As in your output, **1371 observations are dropped** due to missingness in required fields for ANOVA.)
+
+
+```{r}
+#| label: tab-typo-descriptives
+#| tbl-cap: "2×2 typology descriptives (means) and ANOVA on log_comm_rr"
+#| echo: false
+
+# **Table 5. Typology descriptives + ANOVA summary**
+tab_typo_means <- data.frame(
+group = c("High layoff & High RA",
+"High layoff & Low RA",
+"Low layoff & High RA",
+"Low layoff & Low RA"),
+n = c(686, 795, 800, 680),
+mean_log_rr   = c(-0.268, 0.223, -0.125, 0.262),
+mean_log_rate = c(0.0000609, 0.0001270, 0.0000658, 0.0001230),
+mean_comm     = c(11.6, 2.90, 18.1, 3.38),
+mean_noise    = c(0.0329, 0.0574, 0.0286, 0.0316)
+)
+
+tab_anova <- data.frame(
+test = "ANOVA: log_comm_rr ~ appr_layoff_type",
+df = "F(3, 1586)",
+F_value = 45.2,
+p_value = "<2e-16",
+dropped_obs = 1371
+)
+
+kable(tab_typo_means, digits = 6)
+kable(tab_anova)
+```
+
+#### 5.3 Regression tests with controls: OLS vs SAR (spatial lag)
+
+To test whether typology differences persist after conditioning on covariates and explicitly modeling spatial dependence, I estimate (i) an OLS model and (ii) a SAR model using queen-contiguity weights. In both models, the reference category is **“Low layoff & Low RA.”**
+
+Across OLS and SAR, the only typology contrast that is robustly different from the baseline is **“High layoff & High RA”**, which is negative and statistically significant:
+
+* OLS: −0.1248 (SE 0.0551, p = 0.0238)
+* SAR: −0.1246 (SE 0.0527, p = 0.0182)
+
+The SAR model confirms strong spatial dependence (**rho = 0.2667**, LR test **99.621**, p < 2.22e-16), improves fit (**AIC 3081.9 → 2984.3**), and removes residual spatial autocorrelation (residual Moran’s I **−0.00325**, p = **0.5517**; LM residual autocorr p = **0.7048**).
+
+
+```{r}
+#| label: tab-typo-ols-sar
+#| tbl-cap: "Typology effects on log_comm_rr: OLS vs SAR (reference = Low layoff & Low RA)"
+#| echo: false
+
+# **Table 6. Typology effects on `log_comm_rr` (OLS vs SAR), with diagnostics**
+
+tab_typo_reg <- data.frame(
+term = c("(Intercept)",
+"High layoff & High RA",
+"High layoff & Low RA",
+"Low layoff & High RA",
+"ln_emp_total",
+"ln_pcap_inc",
+"ln_pop",
+"ln_emp_manu",
+"unemployment_rate",
+"voteshare_dg",
+"rho (SAR)",
+"AIC",
+"Residual Moran's I (SAR)",
+"Residual Moran p-value (SAR)",
+"LM residual autocorr p (SAR)"),
+OLS = c("-6.768317 (SE 0.980071, p=7.20e-12)",
+"-0.124775 (SE 0.055149, p=0.0238)",
+"-0.029447 (SE 0.056354, p=0.6014)",
+" 0.041747 (SE 0.054330, p=0.4424)",
+"-0.008085 (SE 0.058437, p=0.8900)",
+" 0.861479 (SE 0.088878, p<2e-16)",
+"-0.270347 (SE 0.060803, p=9.35e-06)",
+"-0.029220 (SE 0.011991, p=0.0149)",
+" 7.154299 (SE 1.120835, p=2.28e-10)",
+" 0.775910 (SE 0.137616, p=2.03e-08)",
+NA,
+"3081.9",
+NA, NA, NA),
+SAR = c("-6.287091 (SE 0.937077, p=1.956e-11)",
+"-0.124559 (SE 0.052730, p=0.018166)",
+"-0.021560 (SE 0.053878, p=0.689032)",
+" 0.016080 (SE 0.051943, p=0.756892)",
+"-0.054099 (SE 0.056089, p=0.334792)",
+" 0.786458 (SE 0.085100, p<2.2e-16)",
+"-0.187793 (SE 0.058751, p=0.001391)",
+"-0.025437 (SE 0.011477, p=0.026668)",
+" 4.988944 (SE 1.074214, p=3.413e-06)",
+" 0.738168 (SE 0.132248, p=2.382e-08)",
+"0.26666 (LR=99.621, p<2.22e-16)",
+"2984.3",
+"-0.003249",
+"0.5517",
+"0.70475")
+)
+
+kable(tab_typo_reg, col.names = c("Term", "OLS", "SAR"))
+```
+
+#### 5.4 Interpretation
+
+Descriptively, the 2×2 split shows large differences in mean `log_comm_rr`, and ANOVA strongly rejects equal means across groups. After adding controls and modeling spatial dependence, the only robust difference relative to the “Low layoff & Low RA” baseline is that **“High layoff & High RA”** counties have **lower** `log_comm_rr`. The SAR model also indicates that IRA commenting intensity remains spatially clustered (rho significant), but residual spatial autocorrelation is effectively addressed in this specification.
+
+```{r}
+#| label: export-typology-fips
+#| message: false
+#| warning: false
+
+# df_typo <- panel_typo %>% st_drop_geometry()
+
+# for (lvl in levels(df_typo$appr_layoff_type)) {
+#   df_typo %>%
+#     filter(appr_layoff_type == lvl) %>%
+#     select(fips) %>%
+#     write_csv(
+#       paste0(
+#         "fips_",
+#         gsub(" ", "_", gsub("&", "and", tolower(lvl))),
+#         ".csv"
+#       )
+#     )
+# }
+```
+
+
+### 6. LDA by typology group
+
+```{r}
+#| label: table-topic-words-from-csvpath
+#| message: false
+#| warning: false
+
+library(readr)
+library(knitr)
+
+CSV_PATH <- file.path(DATA_DIR, "topic_words_all_groups_k30.csv")
+
+tab <- readr::read_csv(CSV_PATH, show_col_types = FALSE)
+
+if (knitr::is_html_output()) {
+  library(DT)
+  DT::datatable(
+    tab,
+    rownames = FALSE,
+    options = list(
+      pageLength = 10,
+      scrollX = TRUE,
+      autoWidth = TRUE,
+      dom = "ftip",
+      lengthChange = FALSE
+    )
+  )
+} else {
+  knitr::kable(tab)
+}
+
+```
+
+
+
+## VI. Discussion
+
+This paper links county-level excess commenting on 2022 IRA rulemaking to steel-related disruption and place-based industrial geography, under the premise that notice-and-comment participation is best read as **spatially distributed participation intensity** rather than a directly attributable causal input to regulatory text. Two results anchor the interpretation. First, both `log_comm_rr` and `log_comm_rate` exhibit substantial **positive spatial autocorrelation**, and OLS residuals remain strongly spatially patterned in multiple specifications. Spatial-lag (SAR) models consistently improve fit and largely absorb residual clustering, implying that credible inference in this setting requires treating spillovers and shared regional context as part of the data-generating process, not as a nuisance.
+
+Second, the evidence for a simple “layoffs → more comments” mechanism is limited. Steel value-chain layoff exposure is positively associated with excess commenting in a bivariate baseline, but the relationship disappears once standard socioeconomic and political controls are added, in both OLS and SAR. By contrast, **place-based steel geography** matters more robustly: point measures of steel presence (plant hosting and plant counts) are not predictive, while membership in a contiguity-expanded **steel corridor** is associated with higher excess commenting and remains stable under spatial modeling. The corridor result is consistent with an exposure model operating at the **regional industrial footprint** level—commuting sheds, supply-chain linkages, and shared civic infrastructures—rather than at the county boundary of a single facility. A falsification-style comparator based on manufacturing-share “industrial belt” clustering is not significant in SAR, supporting the interpretation that the corridor association is not merely generic “manufacturing-region” participation.
+
+Workforce-development capacity, proxied by `ln_appr_all`, is itself extremely spatially clustered, and SAR models reveal strong dependence that is not fully explained by observed covariates—consistent with apprenticeship systems reflecting broader state/regional institutional ecosystems. The layoff × apprenticeship 2×2 typology adds a policy-relevant descriptive layer: mean excess commenting differs across cells, but after controls and spatial dependence the most robust contrast is that **High layoff & High RA** counties exhibit **lower** excess commenting relative to the low–low baseline. This pattern is suggestive of heterogeneity in response channels—places with stronger institutional capacity may translate disruption into adjustment through workforce systems rather than higher rulemaking participation—though the design remains descriptive rather than causal.
+
+Finally, a content-based check aligns with these quantitative patterns. Using within-group LDA portraits (k=30 per group), all four typology groups revolve around the same backbone—tax credit eligibility language, 45V electricity matching, and lifecycle emissions/methane accounting—but they bundle these elements differently. High layoff & High RA discourse more often fuses compliance language with environmental and equity constraints (including hourly matching design), High layoff & Low RA exhibits broader sectoral “route expansion” framing (e.g., ethanol/waste/industrial feedstocks), Low layoff & High RA concentrates union/PWA/apprenticeship-coded language alongside matching debates, and Low layoff & Low RA more frequently tilts toward manufacturing incentives (e.g., 45X) and grid/infrastructure eligibility. These topic portraits do not establish causality, but they provide qualitative coherence: what varies across places is not only *how much* they comment, but also *how* they frame what is at stake in IRA rulemaking.
+
+**The limitations of this study are as follows:** The analysis is a 2022 cross-section with lagged 2021 covariates; comment intensity can reflect organized campaigns and is not necessarily representative; excluding DC improves geographic interpretability but removes a key organizational hub; and spatial models mitigate inference problems from dependence but do not by themselves identify causal mechanisms. Within these constraints, the main contribution is to show that IRA comment participation is fundamentally **place-structured**, and that steel-linked regional footprints organize where excess commenting concentrates.
+
+
+## VII. Conclusion
+
+This study offers a spatially explicit view of public participation in U.S. IRA rulemaking. Using a county-level 2022 cross-section linked to lagged local covariates and place-based measures of steel industrial geography, the analysis indicates that commenting intensity is systematically clustered in space, implying that spatial dependence is a core feature of the participation landscape rather than a secondary modeling concern.
+
+Substantively, the results indicate that participation aligns more with **regional industrial footprints** than with a simple county-level “economic shock → participation” story: multi-county steel geographies are more consistently informative about where excess commenting concentrates once baseline county characteristics are taken into account. A policy-relevant 2×2 layoff × apprenticeship typology points in a similar direction, implying that high apprenticeship capacity places are not necessarily the most vocal in rulemaking participation.
+
+Overall, the paper implies that “who shows up” in federal rulemaking is shaped by place-based structures and regional context, and it provides a template for extending spatial participation analysis across dockets and years to assess how durable these geographic patterns are across regulatory domains.
+
